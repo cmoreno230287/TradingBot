@@ -1,0 +1,43 @@
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: #0c1118;
+  color: #e6edf3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.mat-mdc-card {
+  --mdc-elevated-card-container-color: #141b25;
+  --mdc-outlined-card-outline-color: #263243;
+}
+
+.mat-mdc-button-base {
+  letter-spacing: 0;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot.ok {
+  background: #2fd67c;
+}
+
+.status-dot.warn {
+  background: #f2cc60;
+}
+
+.status-dot.danger {
+  background: #ff6b6b;
+}

@@ -1,0 +1,467 @@
+.shell {
+  min-height: 100vh;
+  background: #0c1118;
+}
+
+.side-nav {
+  width: 248px;
+  border-right: 1px solid #233044;
+  background: #0f151f;
+  color: #dce7f3;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 78px;
+  padding: 0 22px;
+  border-bottom: 1px solid #233044;
+}
+
+.brand mat-icon {
+  color: #26a69a;
+}
+
+.brand strong,
+.brand span {
+  display: block;
+}
+
+.brand strong {
+  font-size: 18px;
+}
+
+.brand span {
+  color: #8b98aa;
+  font-size: 12px;
+}
+
+nav {
+  padding: 18px 12px;
+}
+
+nav button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  margin-bottom: 6px;
+  border: 0;
+  color: #9ba8bb;
+  background: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+
+mat-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  font-size: 0 !important;
+  line-height: 1;
+}
+
+mat-icon::before {
+  content: "";
+  width: 18px;
+  height: 18px;
+  display: block;
+  background: currentColor;
+  border-radius: 4px;
+  clip-path: polygon(12% 18%, 88% 18%, 88% 82%, 12% 82%);
+}
+
+nav button.active,
+nav button:hover {
+  background: #172132;
+  color: #eef5ff;
+}
+
+.topbar {
+  height: 78px;
+  padding: 0 28px;
+  background: #101722;
+  border-bottom: 1px solid #233044;
+  color: #e6edf3;
+}
+
+.topbar h1,
+.topbar p {
+  margin: 0;
+}
+
+.topbar h1 {
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.topbar p {
+  margin-top: 4px;
+  color: #8b98aa;
+  font-size: 13px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.content {
+  padding: 24px;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.status-card {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid #263243;
+  border-radius: 8px;
+}
+
+.status-card mat-icon {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #172132;
+  color: #8fb6ff;
+}
+
+.status-card mat-icon.ok {
+  color: #2fd67c;
+}
+
+.status-card mat-icon.warn {
+  color: #f2cc60;
+}
+
+.status-card span,
+.status-card small {
+  display: block;
+  color: #8b98aa;
+}
+
+.status-card strong {
+  display: block;
+  margin: 3px 0;
+  font-size: 22px;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 18px;
+}
+
+mat-card {
+  border: 1px solid #263243;
+  border-radius: 8px;
+  color: #172033;
+}
+
+.chart-card,
+.control-stack mat-card,
+.lower-grid mat-card {
+  padding: 18px;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.card-header h2,
+.card-header p {
+  margin: 0;
+}
+
+.card-header h2 {
+  margin-top: 4px;
+  font-size: 22px;
+  color: #172033;
+}
+
+.card-header.compact h2 {
+  font-size: 18px;
+}
+
+.eyebrow {
+  color: #76d7c4;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chart {
+  border: 1px solid #263243;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #101722;
+}
+
+.chart-card {
+  color: #172033;
+}
+
+.chart svg {
+  width: 100%;
+  display: block;
+}
+
+.grid line {
+  stroke: #243041;
+  stroke-width: 1;
+}
+
+.fvg {
+  fill: #f2cc60;
+  opacity: 0.18;
+  stroke: #f2cc60;
+  stroke-dasharray: 8 7;
+}
+
+.fvg-label,
+.annotation {
+  fill: #d9e7f5;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.annotation-line {
+  stroke: #58a6ff;
+  stroke-width: 2;
+}
+
+.sweep-marker {
+  fill: none;
+  stroke: #f2cc60;
+  stroke-width: 4;
+}
+
+.tp-line,
+.entry-line,
+.sl-line {
+  stroke-width: 2;
+}
+
+.tp-line {
+  stroke: #2ecc71;
+}
+
+.entry-line {
+  stroke: #f2cc60;
+}
+
+.sl-line {
+  stroke: #ff6b6b;
+}
+
+.level {
+  font-family: Consolas, monospace;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.level.tp {
+  fill: #2ecc71;
+}
+
+.level.entry {
+  fill: #f2cc60;
+}
+
+.level.sl {
+  fill: #ff6b6b;
+}
+
+.control-stack {
+  display: grid;
+  gap: 18px;
+  align-content: start;
+}
+
+mat-button-toggle-group,
+mat-form-field {
+  width: 100%;
+}
+
+mat-form-field {
+  margin-top: 14px;
+}
+
+.button-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.signal-list {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.signal-list div {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid #263243;
+}
+
+.signal-list span {
+  color: #8b98aa;
+}
+
+.signal-list strong {
+  font-family: Consolas, monospace;
+}
+
+.lower-grid {
+  display: grid;
+  grid-template-columns: 420px minmax(0, 1fr);
+  gap: 18px;
+  margin-top: 18px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.detail-grid mat-card {
+  padding: 18px;
+}
+
+.wide-card {
+  grid-column: 1 / -1;
+}
+
+.detail-list {
+  display: grid;
+  gap: 12px;
+}
+
+.detail-list div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 13px 0;
+  border-bottom: 1px solid #263243;
+}
+
+.detail-list span {
+  color: #7b8aa2;
+  font-weight: 600;
+}
+
+.detail-list strong {
+  color: #111827;
+  font-family: Consolas, monospace;
+  text-align: right;
+}
+
+.guardrails {
+  display: grid;
+  gap: 14px;
+}
+
+.guardrails div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #52627a;
+  font-weight: 600;
+}
+
+.guardrails mat-icon {
+  color: #2fd67c;
+}
+
+table {
+  width: 100%;
+  background: transparent;
+}
+
+th {
+  color: #52627a;
+  font-weight: 700;
+}
+
+td {
+  color: #172033;
+  font-weight: 500;
+}
+
+.signal-list span {
+  color: #7b8aa2;
+  font-weight: 600;
+}
+
+.signal-list strong {
+  color: #111827;
+}
+
+.control-stack mat-card,
+.lower-grid mat-card,
+.detail-grid mat-card {
+  color: #172033;
+}
+
+.control-stack .card-header h2,
+.lower-grid .card-header h2,
+.detail-grid .card-header h2 {
+  color: #172033;
+}
+
+@media (max-width: 1180px) {
+  .status-grid,
+  .workspace,
+  .lower-grid,
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .side-nav {
+    width: 220px;
+  }
+}
+
+@media (max-width: 760px) {
+  .side-nav {
+    display: none;
+  }
+
+  .content {
+    padding: 16px;
+  }
+
+  .topbar {
+    padding: 0 16px;
+  }
+
+  .topbar mat-chip-set {
+    display: none;
+  }
+}

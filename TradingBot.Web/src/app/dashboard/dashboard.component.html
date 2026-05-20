@@ -1,0 +1,285 @@
+<mat-sidenav-container class="shell">
+  <mat-sidenav mode="side" opened class="side-nav">
+    <div class="brand">
+      <mat-icon>candlestick_chart</mat-icon>
+      <div>
+        <strong>TradingBot</strong>
+        <span>Forex automation</span>
+      </div>
+    </div>
+
+    <nav>
+      <button
+        type="button"
+        *ngFor="let item of navItems"
+        [class.active]="activeSection() === item.id"
+        (click)="activeSection.set(item.id)">
+        <mat-icon>{{ item.icon }}</mat-icon>
+        <span>{{ item.label }}</span>
+      </button>
+    </nav>
+  </mat-sidenav>
+
+  <mat-sidenav-content>
+    <mat-toolbar class="topbar">
+      <div>
+        <h1>{{ pageTitle() }}</h1>
+        <p>{{ pageSubtitle() }}</p>
+      </div>
+      <span class="spacer"></span>
+      <mat-chip-set>
+        <mat-chip><span class="status-dot ok"></span> Live</mat-chip>
+        <mat-chip><span class="status-dot ok"></span> Token fresh</mat-chip>
+      </mat-chip-set>
+    </mat-toolbar>
+
+    <main class="content">
+      <section class="status-grid" *ngIf="activeSection() === 'dashboard'">
+        <mat-card *ngFor="let card of statusCards" class="status-card">
+          <mat-icon [class]="card.state">{{ card.icon }}</mat-icon>
+          <div>
+            <span>{{ card.label }}</span>
+            <strong>{{ card.value }}</strong>
+            <small>{{ card.meta }}</small>
+          </div>
+        </mat-card>
+      </section>
+
+      <section class="workspace" *ngIf="activeSection() === 'dashboard' || activeSection() === 'strategy'">
+        <mat-card class="chart-card">
+          <div class="card-header">
+            <div>
+              <span class="eyebrow">Market Structure</span>
+              <h2>Valid BUY Setup</h2>
+            </div>
+            <mat-chip-set>
+              <mat-chip>London NY Overlap</mat-chip>
+              <mat-chip>3.0R</mat-chip>
+            </mat-chip-set>
+          </div>
+
+          <div class="chart">
+            <svg viewBox="0 0 900 620" role="img" aria-label="EURUSD valid setup chart">
+              <rect x="0" y="0" width="900" height="620" fill="#101722" />
+              <g class="grid">
+                <line *ngFor="let line of [110, 190, 270, 350, 430, 510]" x1="55" [attr.y1]="line" x2="820" [attr.y2]="line" />
+                <line *ngFor="let line of [120, 240, 360, 480, 600, 720]" [attr.x1]="line" y1="70" [attr.x2]="line" y2="560" />
+              </g>
+
+              <rect x="205" [attr.y]="y(1.1027)" width="255" [attr.height]="y(1.1008) - y(1.1027)" class="fvg" />
+              <text x="214" [attr.y]="y(1.1027) - 12" class="fvg-label">Bullish FVG</text>
+
+              <line x1="55" [attr.y1]="y(1.113)" x2="820" [attr.y2]="y(1.113)" class="tp-line" />
+              <line x1="55" [attr.y1]="y(1.10175)" x2="820" [attr.y2]="y(1.10175)" class="entry-line" />
+              <line x1="55" [attr.y1]="y(1.098)" x2="820" [attr.y2]="y(1.098)" class="sl-line" />
+
+              <text x="835" [attr.y]="y(1.113) + 5" class="level tp">TP 1.1130</text>
+              <text x="835" [attr.y]="y(1.10175) + 5" class="level entry">Entry 1.10175</text>
+              <text x="835" [attr.y]="y(1.098) + 5" class="level sl">SL 1.0980</text>
+
+              <g *ngFor="let candle of candles">
+                <line [attr.x1]="candle.x" [attr.y1]="y(candle.high)" [attr.x2]="candle.x" [attr.y2]="y(candle.low)" [attr.stroke]="candleColor(candle)" stroke-width="3" />
+                <rect [attr.x]="candle.x - 13" [attr.y]="bodyY(candle)" width="26" [attr.height]="bodyHeight(candle)" rx="2" [attr.fill]="candleColor(candle)" />
+              </g>
+
+              <path d="M160 513 L170 527 L180 513" class="sweep-marker" />
+              <text x="70" y="540" class="annotation">Sell-side liquidity sweep</text>
+              <text x="300" y="120" class="annotation">MSS / BOS confirmation</text>
+              <line x1="300" y1="128" x2="520" y2="145" class="annotation-line" />
+            </svg>
+          </div>
+        </mat-card>
+
+        <aside class="control-stack">
+          <mat-card>
+            <div class="card-header compact">
+              <div>
+                <span class="eyebrow">Command Center</span>
+                <h2>{{ modeLabel() }}</h2>
+              </div>
+            </div>
+
+            <mat-button-toggle-group [value]="mode()" (valueChange)="mode.set($event)" aria-label="Bot mode">
+              <mat-button-toggle value="monitor">Start</mat-button-toggle>
+              <mat-button-toggle value="once">Once</mat-button-toggle>
+              <mat-button-toggle value="paused">Pause</mat-button-toggle>
+            </mat-button-toggle-group>
+
+            <mat-form-field appearance="outline">
+              <mat-label>Symbol</mat-label>
+              <input matInput [formControl]="symbol">
+            </mat-form-field>
+
+            <mat-slide-toggle [formControl]="tradeOutKillZone">
+              Trade out of kill zone
+            </mat-slide-toggle>
+
+            <div class="button-row">
+              <button mat-flat-button color="primary"><mat-icon>play_arrow</mat-icon> Run cycle</button>
+              <button mat-stroked-button><mat-icon>description</mat-icon> Learning report</button>
+            </div>
+          </mat-card>
+
+          <mat-card>
+            <div class="card-header compact">
+              <div>
+                <span class="eyebrow">Current Signal</span>
+                <h2>BUY EURUSD</h2>
+              </div>
+            </div>
+            <div class="signal-list">
+              <div><span>Entry</span><strong>1.10175</strong></div>
+              <div><span>Stop Loss</span><strong>1.0980</strong></div>
+              <div><span>Take Profit</span><strong>1.1130</strong></div>
+              <div><span>Lot Size</span><strong>0.13</strong></div>
+            </div>
+            <mat-progress-bar mode="determinate" value="76"></mat-progress-bar>
+          </mat-card>
+        </aside>
+      </section>
+
+      <section class="lower-grid" *ngIf="activeSection() === 'dashboard'">
+        <mat-card>
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Execution Guardrails</span>
+              <h2>Risk and exposure</h2>
+            </div>
+          </div>
+          <div class="guardrails">
+            <div><mat-icon>check_circle</mat-icon><span>Active trades below max allowed</span></div>
+            <div><mat-icon>check_circle</mat-icon><span>Risk percent within configured limit</span></div>
+            <div><mat-icon>check_circle</mat-icon><span>Live order creation explicitly enabled</span></div>
+          </div>
+        </mat-card>
+
+        <mat-card>
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Reports</span>
+              <h2>Recent outputs</h2>
+            </div>
+          </div>
+          <table mat-table [dataSource]="reports">
+            <ng-container matColumnDef="name">
+              <th mat-header-cell *matHeaderCellDef>Name</th>
+              <td mat-cell *matCellDef="let row">{{ row.name }}</td>
+            </ng-container>
+            <ng-container matColumnDef="type">
+              <th mat-header-cell *matHeaderCellDef>Type</th>
+              <td mat-cell *matCellDef="let row">{{ row.type }}</td>
+            </ng-container>
+            <ng-container matColumnDef="createdAt">
+              <th mat-header-cell *matHeaderCellDef>Created</th>
+              <td mat-cell *matCellDef="let row">{{ row.createdAt }}</td>
+            </ng-container>
+            <ng-container matColumnDef="status">
+              <th mat-header-cell *matHeaderCellDef>Status</th>
+              <td mat-cell *matCellDef="let row">{{ row.status }}</td>
+            </ng-container>
+            <tr mat-header-row *matHeaderRowDef="reportColumns"></tr>
+            <tr mat-row *matRowDef="let row; columns: reportColumns;"></tr>
+          </table>
+        </mat-card>
+      </section>
+
+      <section class="detail-grid" *ngIf="activeSection() === 'broker'">
+        <mat-card>
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Connection</span>
+              <h2>cTrader Live Account</h2>
+            </div>
+            <mat-chip><span class="status-dot ok"></span> Connected</mat-chip>
+          </div>
+          <div class="detail-list">
+            <div><span>Host</span><strong>live.ctraderapi.com:5036</strong></div>
+            <div><span>Account ID</span><strong>47302699</strong></div>
+            <div><span>Mode</span><strong>Live</strong></div>
+            <div><span>Symbol ID</span><strong>1</strong></div>
+          </div>
+        </mat-card>
+
+        <mat-card>
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Exposure</span>
+              <h2>Active Trade Limit</h2>
+            </div>
+          </div>
+          <div class="signal-list">
+            <div><span>Open positions</span><strong>0</strong></div>
+            <div><span>Pending orders</span><strong>0</strong></div>
+            <div><span>Max active trades</span><strong>1</strong></div>
+          </div>
+          <button mat-flat-button color="primary"><mat-icon>sync</mat-icon> Refresh broker state</button>
+        </mat-card>
+      </section>
+
+      <section class="detail-grid" *ngIf="activeSection() === 'reports'">
+        <mat-card class="wide-card">
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Generated Outputs</span>
+              <h2>Reports</h2>
+            </div>
+            <button mat-stroked-button><mat-icon>folder_open</mat-icon> Open folder</button>
+          </div>
+          <table mat-table [dataSource]="reports">
+            <ng-container matColumnDef="name">
+              <th mat-header-cell *matHeaderCellDef>Name</th>
+              <td mat-cell *matCellDef="let row">{{ row.name }}</td>
+            </ng-container>
+            <ng-container matColumnDef="type">
+              <th mat-header-cell *matHeaderCellDef>Type</th>
+              <td mat-cell *matCellDef="let row">{{ row.type }}</td>
+            </ng-container>
+            <ng-container matColumnDef="createdAt">
+              <th mat-header-cell *matHeaderCellDef>Created</th>
+              <td mat-cell *matCellDef="let row">{{ row.createdAt }}</td>
+            </ng-container>
+            <ng-container matColumnDef="status">
+              <th mat-header-cell *matHeaderCellDef>Status</th>
+              <td mat-cell *matCellDef="let row">{{ row.status }}</td>
+            </ng-container>
+            <tr mat-header-row *matHeaderRowDef="reportColumns"></tr>
+            <tr mat-row *matRowDef="let row; columns: reportColumns;"></tr>
+          </table>
+        </mat-card>
+      </section>
+
+      <section class="detail-grid" *ngIf="activeSection() === 'settings'">
+        <mat-card>
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Trading</span>
+              <h2>Execution Settings</h2>
+            </div>
+          </div>
+          <mat-form-field appearance="outline">
+            <mat-label>Symbol</mat-label>
+            <input matInput [formControl]="symbol">
+          </mat-form-field>
+          <mat-slide-toggle [formControl]="tradeOutKillZone">
+            Trade out of kill zone
+          </mat-slide-toggle>
+        </mat-card>
+
+        <mat-card>
+          <div class="card-header compact">
+            <div>
+              <span class="eyebrow">Risk</span>
+              <h2>Risk Controls</h2>
+            </div>
+          </div>
+          <div class="detail-list">
+            <div><span>Risk per trade</span><strong>0.5%</strong></div>
+            <div><span>Minimum RR</span><strong>2.0</strong></div>
+            <div><span>Preferred RR</span><strong>3.0</strong></div>
+            <div><span>Max active trades</span><strong>1</strong></div>
+          </div>
+        </mat-card>
+      </section>
+    </main>
+  </mat-sidenav-content>
+</mat-sidenav-container>
