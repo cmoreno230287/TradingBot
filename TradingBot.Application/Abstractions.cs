@@ -21,10 +21,87 @@ public interface IHistoricalMarketDataProvider
     Task<IReadOnlyList<Candle>> GetCandlesAsync(HistoricalDataRequest request, CancellationToken cancellationToken);
 }
 
+public sealed record HistoricalTickDataRequest(
+    string Symbol,
+    DateTimeOffset From,
+    DateTimeOffset To);
+
+public interface IHistoricalTickDataProvider
+{
+    string ProviderName { get; }
+
+    Task<IReadOnlyList<MarketTick>> GetTicksAsync(HistoricalTickDataRequest request, CancellationToken cancellationToken);
+}
+
 public interface IHistoricalMarketDataProviderFactory
 {
     IHistoricalMarketDataProvider Resolve(string providerName);
 }
+
+public sealed record ActiveTradeSummary(int OpenPositions, int PendingOrders)
+{
+    public int TotalActiveTrades => OpenPositions + PendingOrders;
+}
+
+public sealed record BrokerOrderCreationResult(
+    string ClientOrderId,
+    string BrokerOrderId,
+    long? AccountId,
+    long? SymbolId,
+    string TradeSide,
+    decimal Lots,
+    long Volume,
+    decimal LimitPrice,
+    decimal StopLoss,
+    decimal TakeProfit,
+    decimal RiskReward);
+
+public sealed record MarketExecutionSnapshot(
+    string Symbol,
+    decimal Bid,
+    decimal Ask,
+    decimal SpreadPips,
+    DateTimeOffset Timestamp);
+
+public sealed record StaleOrderCleanupResult(
+    int CheckedOrders,
+    int CancelledOrders,
+    IReadOnlyList<string> CancelledOrderIds);
+
+public sealed record ClosedTradeReport(
+    string TradeId,
+    string Symbol,
+    string Session,
+    string Direction,
+    decimal EntryPrice,
+    decimal ClosePrice,
+    decimal StopLossPrice,
+    decimal TakeProfitPrice,
+    decimal RiskRewardRatio,
+    DateTimeOffset OpenedAt,
+    DateTimeOffset ClosedAt,
+    decimal Volume,
+    decimal Profit,
+    decimal Commission,
+    decimal Swap,
+    decimal NetProfit,
+    long MagicNumber,
+    string Comment);
+
+public sealed record SignalReport(
+    string SignalId,
+    string Symbol,
+    string Session,
+    string Direction,
+    decimal EntryPrice,
+    decimal StopLossPrice,
+    decimal TakeProfitPrice,
+    decimal RiskRewardRatio,
+    DateTimeOffset CreatedAt,
+    string SetupReason,
+    string ScreenshotH1,
+    string ScreenshotM5,
+    string ScreenshotM1);
 
 public interface IBrokerClient
 {

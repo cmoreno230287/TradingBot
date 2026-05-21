@@ -48,6 +48,17 @@ public sealed record Candle(
     public bool IsBearish => Close < Open;
 }
 
+public sealed record MarketTick(
+    string Symbol,
+    DateTimeOffset Timestamp,
+    decimal Bid,
+    decimal Ask,
+    decimal Last,
+    decimal Volume)
+{
+    public decimal Mid => Last > 0m ? Last : (Bid + Ask) / 2m;
+}
+
 public sealed record FairValueGap(
     TradeDirection Direction,
     decimal LowerPrice,
