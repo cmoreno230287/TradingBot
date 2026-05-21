@@ -13,14 +13,33 @@ public sealed class NewsFilter(TradingBotOptions options) : INewsFilter
             return false;
         }
 
-        var events = Array.Empty<DateTimeOffset>();
-        var blocked = events.Any(e => timestamp >= e.AddMinutes(-options.MinutesBeforeHighImpactNews) && timestamp <= e.AddMinutes(options.MinutesAfterHighImpactNews));
-        if (!blocked)
+        foreach (var window in options.NewsBlackoutWindowsUtc)
         {
-            return false;
+            if (!TryParseWindow(window, out var from, out var to))
+            {
+                continue;
+            }
+
+            var blockedFrom = from.AddMinutes(-options.MinutesBeforeHighImpactNews);
+            var blockedTo = to.AddMinutes(options.MinutesAfterHighImpactNews);
+            if (timestamp >= blockedFrom && timestamp <= blockedTo)
+            {
+                reason = $"Configured news blackout window is active: {from:O}/{to:O}.";
+                return true;
+            }
         }
 
-        reason = "High-impact news window is active.";
-        return true;
+        return false;
+    }
+
+    private static bool TryParseWindow(string raw, out DateTimeOffset from, out DateTimeOffset to)
+    {
+        from = default;
+        to = default;
+        var parts = raw.Split('/', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length == 2
+            && DateTimeOffset.TryParse(parts[0], out from)
+            && DateTimeOffset.TryParse(parts[1], out to)
+            && to >= from;
     }
 }

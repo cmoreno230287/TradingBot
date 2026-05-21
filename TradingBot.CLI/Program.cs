@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Diagnostics;
 using TradingBot.Application;
 using TradingBot.Backtesting;
 using TradingBot.Domain;
@@ -7,6 +8,7 @@ using TradingBot.Infrastructure.Broker;
 using TradingBot.Infrastructure.Configuration;
 using TradingBot.Infrastructure.Filters;
 using TradingBot.Infrastructure.MarketData;
+using TradingBot.Infrastructure.MetaTrader;
 using TradingBot.Infrastructure.Sessions;
 using TradingBot.Reporting;
 using TradingBot.Shared;
@@ -44,6 +46,7 @@ return command switch
     "backtest" => await BacktestAsync(services, args, cancellationToken),
     "backtest-learning" => await BacktestLearningAsync(services, args, cancellationToken),
     "download-history" => await DownloadHistoryAsync(services, args, cancellationToken),
+    "find-signal" => await FindSignalAsync(services, args, cancellationToken),
     "ctrader-connect" => await CTraderConnectAsync(services, cancellationToken),
     "ctrader-authorize" => await CTraderAuthorizeAsync(services, cancellationToken),
     "ctrader-request-token" => await CTraderRequestTokenAsync(services, cancellationToken),
@@ -52,6 +55,10 @@ return command switch
     "ctrader-account-details" => await CTraderAccountDetailsAsync(services, cancellationToken),
     "ctrader-symbols" => await CTraderSymbolsAsync(services, args, cancellationToken),
     "ctrader-createorder" => await CTraderCreateOrderAsync(services, args, cancellationToken),
+    "mt5-test-connection" => await MT5TestConnectionAsync(services, cancellationToken),
+    "mt5-account-details" => await MT5AccountDetailsAsync(services, cancellationToken),
+    "mt5-symbols" => await MT5SymbolsAsync(services, args, cancellationToken),
+    "mt5-createorder" => await MT5CreateOrderAsync(services, args, cancellationToken),
     "analyze-and-createorder" => await AnalyzeAndCreateOrderAsync(services, args, cancellationToken),
     _ => Help()
 };
@@ -68,33 +75,46 @@ static ServiceRegistry BuildServices(string appsettingsPath, TradingBotOptions o
 {
     var cTraderTester = new CTraderConnectionTester(options);
     var cTraderJsonApi = new CTraderJsonApiClient(options);
-    var marketData = new CTraderMarketDataProvider(cTraderJsonApi, options);
+    var mt5Bridge = new MT5BridgeClient(options);
+    var isMt5 = IsBroker(options, "MT5");
+    IMarketDataProvider marketData = isMt5
+        ? new MT5MarketDataProvider(mt5Bridge)
+        : new CTraderMarketDataProvider(cTraderJsonApi, options);
     var newsFilter = new NewsFilter(options);
     var sessionClock = new NewYorkSessionClock();
     var strategy = new SmartMoneyStrategyEngine(marketData, newsFilter, sessionClock, options);
     var risk = new RiskManager(options);
-    var historicalProvider = BuildHistoricalProvider(options, cTraderJsonApi);
+    var historicalProvider = BuildHistoricalProvider(options, cTraderJsonApi, mt5Bridge);
+    IHistoricalTickDataProvider? tickProvider = string.Equals(options.Backtesting.DataSource, "MT5", StringComparison.OrdinalIgnoreCase)
+        ? new MT5HistoricalTickDataProvider(mt5Bridge)
+        : null;
 
     return new ServiceRegistry(
         appsettingsPath,
         options,
-        new CTraderBrokerClient(options),
+        isMt5 ? new MT5BrokerClient(mt5Bridge, options) : new CTraderBrokerClient(options),
         cTraderTester,
         cTraderJsonApi,
+        mt5Bridge,
         historicalProvider,
         strategy,
         risk,
-        new BacktestingEngine(strategy, risk, historicalProvider, options),
-        new CsvJournalWriter(options));
+        new BacktestingEngine(strategy, risk, historicalProvider, tickProvider, options),
+        new CsvJournalWriter(options),
+        new OperationalLogWriter(options),
+        new ClosedTradeTrackingWriter(options),
+        new SignalTrackingWriter(options));
 }
 
 static IHistoricalMarketDataProvider BuildHistoricalProvider(
     TradingBotOptions options,
-    CTraderJsonApiClient cTraderJsonApi)
+    CTraderJsonApiClient cTraderJsonApi,
+    MT5BridgeClient mt5Bridge)
 {
     var providers = new IHistoricalMarketDataProvider[]
     {
-        new CachedHistoricalMarketDataProvider(new CTraderHistoricalMarketDataProvider(cTraderJsonApi, options), options)
+        new CachedHistoricalMarketDataProvider(new CTraderHistoricalMarketDataProvider(cTraderJsonApi, options), options),
+        new CachedHistoricalMarketDataProvider(new MT5HistoricalMarketDataProvider(mt5Bridge, options), options)
     };
 
     return new HistoricalMarketDataProviderFactory(providers).Resolve(options.Backtesting.DataSource);
@@ -103,12 +123,13 @@ static IHistoricalMarketDataProvider BuildHistoricalProvider(
 static async Task<int> StartAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
 {
     var runOnce = HasStartOnceArg(args);
-    var connectResult = await CaptureConsoleOutputAsync(() => CTraderConnectAsync(services, cancellationToken));
+    var trackingMode = IsTrackingMode(args);
+    var connectResult = await CaptureConsoleOutputAsync(() => ConnectConfiguredBrokerAsync(services, cancellationToken));
     if (connectResult.ExitCode != 0)
     {
         ClearConsoleFully();
         WriteCapturedOutput(connectResult);
-        Console.Error.WriteLine("Startup stopped because cTrader connection failed.");
+        Console.Error.WriteLine("Startup stopped because broker connection failed.");
         return connectResult.ExitCode;
     }
 
@@ -130,6 +151,19 @@ static async Task<int> StartAsync(ServiceRegistry services, string[] args, Cance
                     cancellationToken));
             ClearConsoleFully();
             WriteCapturedOutput(cycleResult);
+
+            if (trackingMode)
+            {
+                var trackingResult = await TrackClosedTradesAsync(services, cancellationToken);
+                if (trackingResult.IsSuccess)
+                {
+                    PrintTradeTracking(trackingResult.Value!.FetchedTrades, trackingResult.Value.WrittenTrades, trackingResult.Value.Directory);
+                }
+                else
+                {
+                    PrintFailure("Trade Tracking", trackingResult.Error!);
+                }
+            }
 
             var cycleExitCode = cycleResult.ExitCode;
             authorizationPromptShown = cycleExitCode == 3 || authorizationPromptShown && cycleExitCode == 3;
@@ -154,7 +188,7 @@ static async Task<int> StartAsync(ServiceRegistry services, string[] args, Cance
         catch (Exception exception)
         {
             ClearConsoleFully();
-            PrintCycleHeader(new TradeSignal(
+            PrintCycleHeader(services.Options, new TradeSignal(
                 services.Options.Symbol,
                 TradeDirection.Buy,
                 0m,
@@ -187,6 +221,29 @@ static async Task<int> StartAsync(ServiceRegistry services, string[] args, Cance
     return 0;
 }
 
+static async Task<int> ConnectConfiguredBrokerAsync(ServiceRegistry services, CancellationToken cancellationToken)
+{
+    if (IsBroker(services.Options, "MT5"))
+    {
+        var result = await services.Broker.ValidateConnectionAsync(cancellationToken);
+        if (!result.IsSuccess)
+        {
+            Console.Error.WriteLine(result.Error);
+            return 3;
+        }
+
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            isConnected = true,
+            broker = "MT5",
+            bridgeBaseUrl = services.Options.MT5.BridgeBaseUrl
+        }, new JsonSerializerOptions { WriteIndented = true }));
+        return 0;
+    }
+
+    return await CTraderConnectAsync(services, cancellationToken);
+}
+
 static int Stop()
 {
     Log("shutdown", "Stop requested. No long-running daemon state is active in this CLI instance.");
@@ -195,10 +252,10 @@ static int Stop()
 
 static async Task<int> AnalyzeAsync(ServiceRegistry services, CancellationToken cancellationToken)
 {
-    var tokenResult = await RefreshCTraderTokenAsync(services, cancellationToken);
-    if (!tokenResult.IsSuccess)
+    var brokerResult = await PrepareConfiguredBrokerForMarketDataAsync(services, cancellationToken);
+    if (!brokerResult.IsSuccess)
     {
-        Console.Error.WriteLine(tokenResult.Error);
+        Console.Error.WriteLine(brokerResult.Error);
         return 3;
     }
 
@@ -232,6 +289,15 @@ static async Task<int> BacktestAsync(ServiceRegistry services, string[] args, Ca
             await SaveCTraderTokensAsync(services.AppsettingsPath, tokenResult.Value.AccessToken, tokenResult.Value.RefreshToken, cancellationToken);
             services.Options.CTrader.AccessToken = tokenResult.Value.AccessToken;
             services.Options.CTrader.RefreshToken = tokenResult.Value.RefreshToken;
+        }
+    }
+    else if (string.Equals(services.Options.Backtesting.DataSource, "MT5", StringComparison.OrdinalIgnoreCase))
+    {
+        var brokerResult = await services.Broker.ValidateConnectionAsync(cancellationToken);
+        if (!brokerResult.IsSuccess)
+        {
+            Console.Error.WriteLine($"Backtest failed: {brokerResult.Error}");
+            return 4;
         }
     }
 
@@ -345,6 +411,13 @@ static async Task<int> BacktestLearningAsync(ServiceRegistry services, string[] 
 
 static async Task<int> DownloadHistoryAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
 {
+    var brokerResult = await PrepareConfiguredBrokerForMarketDataAsync(services, cancellationToken);
+    if (!brokerResult.IsSuccess)
+    {
+        Console.Error.WriteLine($"Download history failed: {brokerResult.Error}");
+        return 3;
+    }
+
     var from = ReadDate(args, "--from") ?? DateTimeOffset.UtcNow.AddDays(-30);
     var to = ReadDate(args, "--to") ?? DateTimeOffset.UtcNow;
     var timeframeText = ReadKeyValueArg(args, "timeframe") ?? "M5";
@@ -372,6 +445,156 @@ static async Task<int> DownloadHistoryAsync(ServiceRegistry services, string[] a
     }, new JsonSerializerOptions { WriteIndented = true }));
 
     return candles.Count > 0 ? 0 : 1;
+}
+
+static async Task<int> FindSignalAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
+{
+    var symbol = ReadKeyValueArg(args, "symbol") ?? services.Options.Symbol;
+    var screenshots = await CaptureTradingViewScreenshotsAsync(services.Options, symbol, cancellationToken);
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        symbol,
+        screenshots = screenshots.Select(item => new { item.Timeframe, item.Path, item.IsCaptured, item.Message })
+    }, new JsonSerializerOptions { WriteIndented = true }));
+
+    var brokerResult = await PrepareConfiguredBrokerForMarketDataAsync(services, cancellationToken);
+    if (!brokerResult.IsSuccess)
+    {
+        Console.Error.WriteLine(brokerResult.Error);
+        return 3;
+    }
+
+    var signal = await services.Strategy.AnalyzeAsync(symbol, DateTimeOffset.UtcNow, cancellationToken);
+    if (!signal.IsValidSetup)
+    {
+        Console.WriteLine(JsonSerializer.Serialize(new
+        {
+            isSignalFound = false,
+            signal.SetupReason,
+            signal.Session
+        }, new JsonSerializerOptions { WriteIndented = true }));
+        return 1;
+    }
+
+    var report = new SignalReport(
+        $"signal-{symbol}-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}",
+        signal.Symbol,
+        signal.Session.ToString(),
+        signal.Direction.ToString().ToUpperInvariant(),
+        signal.EntryPrice,
+        signal.StopLoss,
+        signal.TakeProfit,
+        signal.RiskReward,
+        DateTimeOffset.UtcNow,
+        signal.SetupReason,
+        screenshots.FirstOrDefault(item => item.Timeframe == "1h")?.Path ?? "",
+        screenshots.FirstOrDefault(item => item.Timeframe == "5m")?.Path ?? "",
+        screenshots.FirstOrDefault(item => item.Timeframe == "1m")?.Path ?? "");
+
+    var written = await services.SignalTracker.AppendAsync([report], cancellationToken);
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        isSignalFound = true,
+        signal = report,
+        csvRowsWritten = written
+    }, new JsonSerializerOptions { WriteIndented = true }));
+
+    return 0;
+}
+
+static async Task<IReadOnlyList<ScreenshotCaptureResult>> CaptureTradingViewScreenshotsAsync(
+    TradingBotOptions options,
+    string symbol,
+    CancellationToken cancellationToken)
+{
+    Directory.CreateDirectory(options.TradingView.ScreenshotDirectory);
+    var browser = ResolveBrowserPath(options);
+    var requests = new[]
+    {
+        new { Timeframe = "1h", Interval = "60" },
+        new { Timeframe = "5m", Interval = "5" },
+        new { Timeframe = "1m", Interval = "1" }
+    };
+    var results = new List<ScreenshotCaptureResult>();
+
+    foreach (var request in requests)
+    {
+        var path = Path.GetFullPath(Path.Combine(
+            options.TradingView.ScreenshotDirectory,
+            $"{symbol}_{request.Timeframe}.{options.TradingView.ScreenshotExtension.TrimStart('.')}"));
+        var url = BuildTradingViewChartUrl(options, request.Interval);
+
+        if (browser is null)
+        {
+            results.Add(new ScreenshotCaptureResult(request.Timeframe, path, false, "No supported browser executable was found for headless screenshot capture."));
+            continue;
+        }
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (Exception exception)
+        {
+            results.Add(new ScreenshotCaptureResult(request.Timeframe, path, false, $"Unable to replace existing screenshot: {exception.Message}"));
+            continue;
+        }
+
+        var processInfo = new ProcessStartInfo
+        {
+            FileName = browser,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        processInfo.ArgumentList.Add("--headless=new");
+        processInfo.ArgumentList.Add("--disable-gpu");
+        processInfo.ArgumentList.Add($"--window-size={options.TradingView.ScreenshotWidth},{options.TradingView.ScreenshotHeight}");
+        processInfo.ArgumentList.Add($"--screenshot={path}");
+        processInfo.ArgumentList.Add(url);
+
+        using var screenshotProcess = Process.Start(processInfo);
+        if (screenshotProcess is null)
+        {
+            results.Add(new ScreenshotCaptureResult(request.Timeframe, path, false, "Unable to start browser screenshot process."));
+            continue;
+        }
+
+        await screenshotProcess.WaitForExitAsync(cancellationToken);
+        results.Add(new ScreenshotCaptureResult(
+            request.Timeframe,
+            path,
+            screenshotProcess.ExitCode == 0 && File.Exists(path),
+            screenshotProcess.ExitCode == 0 && File.Exists(path) ? "Captured." : $"Browser exited with code {screenshotProcess.ExitCode}."));
+    }
+
+    return results;
+}
+
+static string BuildTradingViewChartUrl(TradingBotOptions options, string interval)
+{
+    var symbol = Uri.EscapeDataString(options.TradingView.Symbol);
+    return $"https://www.tradingview.com/chart/?symbol={symbol}&interval={Uri.EscapeDataString(interval)}";
+}
+
+static string? ResolveBrowserPath(TradingBotOptions options)
+{
+    if (!string.IsNullOrWhiteSpace(options.TradingView.BrowserPath) && File.Exists(options.TradingView.BrowserPath))
+    {
+        return options.TradingView.BrowserPath;
+    }
+
+    var candidates = new[]
+    {
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe")
+    };
+
+    return candidates.FirstOrDefault(File.Exists);
 }
 
 static async Task<int> CTraderRequestTokenAsync(ServiceRegistry services, CancellationToken cancellationToken)
@@ -449,6 +672,20 @@ static async Task<int> CTraderConnectAsync(ServiceRegistry services, Cancellatio
     var refreshedServices = BuildServices(services.AppsettingsPath, refreshedOptions);
     return await CTraderRequestTokenAsync(refreshedServices, cancellationToken);
 }
+
+static async Task<Result> PrepareConfiguredBrokerForMarketDataAsync(ServiceRegistry services, CancellationToken cancellationToken)
+{
+    if (IsBroker(services.Options, "MT5"))
+    {
+        return await services.Broker.ValidateConnectionAsync(cancellationToken);
+    }
+
+    var tokenResult = await RefreshCTraderTokenAsync(services, cancellationToken);
+    return tokenResult.IsSuccess ? Result.Success() : Result.Failure(tokenResult.Error!);
+}
+
+static bool IsBroker(TradingBotOptions options, string broker) =>
+    string.Equals(options.Broker, broker, StringComparison.OrdinalIgnoreCase);
 
 static async Task<int> CTraderAccountDetailsAsync(ServiceRegistry services, CancellationToken cancellationToken)
 {
@@ -557,7 +794,7 @@ static async Task<int> CTraderCreateOrderAsync(ServiceRegistry services, string[
 
     var activeTradeValidation = await ValidateActiveTradeLimitAsync(
         services,
-        tokenResult.Value.AccessToken ?? services.Options.CTrader.AccessToken,
+        Guid.NewGuid().ToString("N"),
         formattedOutput: false,
         cancellationToken);
     if (!activeTradeValidation.IsSuccess)
@@ -646,6 +883,133 @@ static async Task<int> CTraderSymbolsAsync(ServiceRegistry services, string[] ar
     return 0;
 }
 
+static async Task<int> MT5TestConnectionAsync(ServiceRegistry services, CancellationToken cancellationToken)
+{
+    var result = await services.MT5Bridge.GetHealthAsync(cancellationToken);
+    if (!result.IsSuccess)
+    {
+        Console.Error.WriteLine(result.Error);
+        return 3;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        isConnected = true,
+        broker = "MT5",
+        bridgeBaseUrl = services.Options.MT5.BridgeBaseUrl,
+        health = result.Value
+    }, new JsonSerializerOptions { WriteIndented = true }));
+
+    return 0;
+}
+
+static async Task<int> MT5AccountDetailsAsync(ServiceRegistry services, CancellationToken cancellationToken)
+{
+    var result = await services.MT5Bridge.GetAccountAsync(cancellationToken);
+    if (!result.IsSuccess)
+    {
+        Console.Error.WriteLine(result.Error);
+        return 3;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        broker = "MT5",
+        configuredAccountId = services.Options.MT5.AccountId,
+        account = result.Value
+    }, new JsonSerializerOptions { WriteIndented = true }));
+
+    return 0;
+}
+
+static async Task<int> MT5SymbolsAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
+{
+    var symbolName = ReadKeyValueArg(args, "symbol") ?? services.Options.Symbol;
+    var result = await services.MT5Bridge.GetSymbolAsync(symbolName, cancellationToken);
+    if (!result.IsSuccess)
+    {
+        Console.Error.WriteLine(result.Error);
+        return 3;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(new
+    {
+        broker = "MT5",
+        searchedSymbol = symbolName,
+        symbol = result.Value
+    }, new JsonSerializerOptions { WriteIndented = true }));
+
+    return 0;
+}
+
+static async Task<int> MT5CreateOrderAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
+{
+    if (!TryReadDecimalArg(args, "entry_point", out var entryPoint) || !TryReadDecimalArg(args, "quantity", out var quantity))
+    {
+        Console.Error.WriteLine("Usage: TradingBot.CLI mt5-createorder entry_point=[value] quantity=[value] [confirm_live_order=true]");
+        return 2;
+    }
+
+    if (!services.Options.MT5.AllowLiveOrderCreation && !HasFlagArg(args, "confirm_live_order", "true"))
+    {
+        Console.Error.WriteLine("MT5 order creation requires MT5:AllowLiveOrderCreation=true or confirm_live_order=true.");
+        return 2;
+    }
+
+    var signal = new TradeSignal(
+        services.Options.Symbol,
+        TradeDirection.Buy,
+        entryPoint,
+        entryPoint - (services.Options.PipSize * 20m),
+        entryPoint + (services.Options.PipSize * 60m),
+        3m,
+        SessionName.Closed,
+        true,
+        "Manual MT5 order test.");
+
+    var cycleId = Guid.NewGuid().ToString("N");
+    await services.Monitor.WriteAsync(cycleId, "manual_mt5_order_started", new
+    {
+        entryPoint,
+        quantity
+    }, cancellationToken);
+
+    var marketGuard = await ValidateMarketExecutionGuardAsync(services, cycleId, formattedOutput: false, cancellationToken);
+    if (!marketGuard.IsSuccess)
+    {
+        Console.Error.WriteLine(marketGuard.Error);
+        return 4;
+    }
+
+    var staleCleanup = await CleanupStalePendingOrdersAsync(services, cycleId, formattedOutput: false, cancellationToken);
+    if (!staleCleanup.IsSuccess)
+    {
+        Console.Error.WriteLine(staleCleanup.Error);
+        return 4;
+    }
+
+    var activeTradeValidation = await ValidateActiveTradeLimitAsync(
+        services,
+        cycleId,
+        formattedOutput: false,
+        cancellationToken);
+    if (!activeTradeValidation.IsSuccess)
+    {
+        Console.Error.WriteLine(activeTradeValidation.Error);
+        return 4;
+    }
+
+    var result = await services.MT5Bridge.CreateLimitOrderAsync(signal, quantity, cancellationToken);
+    if (!result.IsSuccess)
+    {
+        Console.Error.WriteLine(result.Error);
+        return 4;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(result.Value, new JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 static async Task<int> AnalyzeAndCreateOrderAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
 {
     return await ExecuteAnalyzeAndCreateOrderAsync(
@@ -658,13 +1022,18 @@ static async Task<int> AnalyzeAndCreateOrderAsync(ServiceRegistry services, stri
 
 static async Task<Result> ValidateActiveTradeLimitAsync(
     ServiceRegistry services,
-    string accessToken,
+    string cycleId,
     bool formattedOutput,
     CancellationToken cancellationToken)
 {
-    var summaryResult = await services.CTraderJsonApi.GetActiveTradeSummaryAsync(accessToken, cancellationToken);
+    var summaryResult = await GetActiveTradeSummaryAsync(services, cancellationToken);
     if (!summaryResult.IsSuccess)
     {
+        await services.Monitor.WriteAsync(cycleId, "active_trade_check_failed", new
+        {
+            summaryResult.Error
+        }, cancellationToken);
+
         if (formattedOutput)
         {
             PrintFailure("Active Trade Check", summaryResult.Error!);
@@ -674,17 +1043,191 @@ static async Task<Result> ValidateActiveTradeLimitAsync(
     }
 
     var summary = summaryResult.Value!;
+    await services.Monitor.WriteAsync(cycleId, "active_trade_checked", new
+    {
+        summary.OpenPositions,
+        summary.PendingOrders,
+        summary.TotalActiveTrades,
+        maxActiveTrades = GetMaxActiveTrades(services.Options)
+    }, cancellationToken);
+
     if (formattedOutput)
     {
-        PrintActiveTradeSummary(summary, services.Options.MaxActiveTrades);
+        PrintActiveTradeSummary(summary, GetMaxActiveTrades(services.Options));
     }
 
-    if (summary.TotalActiveTrades >= services.Options.MaxActiveTrades)
+    var maxActiveTrades = GetMaxActiveTrades(services.Options);
+    if (summary.TotalActiveTrades >= maxActiveTrades)
     {
-        return Result.Failure($"Active trade limit reached. Active={summary.TotalActiveTrades}, MaxAllowed={services.Options.MaxActiveTrades}.");
+        await services.Monitor.WriteAsync(cycleId, "active_trade_limit_reached", new
+        {
+            summary.TotalActiveTrades,
+            maxActiveTrades
+        }, cancellationToken);
+
+        return Result.Failure($"Active trade limit reached. Active={summary.TotalActiveTrades}, MaxAllowed={maxActiveTrades}.");
     }
 
     return Result.Success();
+}
+
+static async Task<Result> ValidateMarketExecutionGuardAsync(
+    ServiceRegistry services,
+    string cycleId,
+    bool formattedOutput,
+    CancellationToken cancellationToken)
+{
+    if (!IsBroker(services.Options, "MT5"))
+    {
+        return Result.Success();
+    }
+
+    var snapshot = await services.MT5Bridge.GetMarketExecutionSnapshotAsync(services.Options.Symbol, cancellationToken);
+    if (!snapshot.IsSuccess)
+    {
+        await services.Monitor.WriteAsync(cycleId, "market_guard_failed", new
+        {
+            snapshot.Error
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintFailure("Market Execution Guard", snapshot.Error!);
+        }
+
+        return Result.Failure(snapshot.Error!);
+    }
+
+    var value = snapshot.Value!;
+    await services.Monitor.WriteAsync(cycleId, "market_guard_checked", new
+    {
+        value.Bid,
+        value.Ask,
+        value.SpreadPips,
+        maxSpreadPips = services.Options.MaxSpreadPips,
+        maxSlippagePoints = services.Options.MT5.MaxSlippagePoints
+    }, cancellationToken);
+
+    if (formattedOutput)
+    {
+        PrintMarketExecutionGuard(value, services.Options.MaxSpreadPips, services.Options.MT5.MaxSlippagePoints);
+    }
+
+    if (value.Bid <= 0m || value.Ask <= 0m || value.Ask < value.Bid)
+    {
+        await services.Monitor.WriteAsync(cycleId, "market_guard_rejected", new
+        {
+            reason = "Invalid MT5 quote.",
+            value.Bid,
+            value.Ask
+        }, cancellationToken);
+
+        return Result.Failure($"Invalid MT5 quote. Bid={value.Bid}, Ask={value.Ask}.");
+    }
+
+    if (value.SpreadPips > services.Options.MaxSpreadPips)
+    {
+        await services.Monitor.WriteAsync(cycleId, "market_guard_rejected", new
+        {
+            reason = "Spread exceeded maximum.",
+            value.SpreadPips,
+            maxSpreadPips = services.Options.MaxSpreadPips
+        }, cancellationToken);
+
+        return Result.Failure($"Spread guard blocked order creation. Spread={decimal.Round(value.SpreadPips, 2)} pips, MaxAllowed={services.Options.MaxSpreadPips} pips.");
+    }
+
+    return Result.Success();
+}
+
+static async Task<Result> CleanupStalePendingOrdersAsync(
+    ServiceRegistry services,
+    string cycleId,
+    bool formattedOutput,
+    CancellationToken cancellationToken)
+{
+    if (!IsBroker(services.Options, "MT5") || !services.Options.MT5.CancelStalePendingOrders)
+    {
+        return Result.Success();
+    }
+
+    var cleanup = await services.MT5Bridge.CancelStalePendingOrdersAsync(cancellationToken);
+    if (!cleanup.IsSuccess)
+    {
+        await services.Monitor.WriteAsync(cycleId, "stale_order_cleanup_failed", new
+        {
+            cleanup.Error
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintFailure("Stale Order Cleanup", cleanup.Error!);
+        }
+
+        return Result.Failure(cleanup.Error!);
+    }
+
+    if (formattedOutput)
+    {
+        PrintStaleOrderCleanup(cleanup.Value!);
+    }
+
+    await services.Monitor.WriteAsync(cycleId, "stale_order_cleanup_completed", new
+    {
+        cleanup.Value!.CheckedOrders,
+        cleanup.Value.CancelledOrders,
+        cleanup.Value.CancelledOrderIds
+    }, cancellationToken);
+
+    return Result.Success();
+}
+
+static async Task<Result<ActiveTradeSummary>> GetActiveTradeSummaryAsync(ServiceRegistry services, CancellationToken cancellationToken)
+{
+    if (IsBroker(services.Options, "MT5"))
+    {
+        return await services.MT5Bridge.GetActiveTradesAsync(cancellationToken);
+    }
+
+    var accessToken = services.Options.CTrader.AccessToken;
+    if (string.IsNullOrWhiteSpace(accessToken))
+    {
+        return Result<ActiveTradeSummary>.Failure("cTrader access token is required for active trade check.");
+    }
+
+    var result = await services.CTraderJsonApi.GetActiveTradeSummaryAsync(accessToken, cancellationToken);
+    return result.IsSuccess
+        ? Result<ActiveTradeSummary>.Success(new ActiveTradeSummary(result.Value!.OpenPositions, result.Value.PendingOrders))
+        : Result<ActiveTradeSummary>.Failure(result.Error!);
+}
+
+static int GetMaxActiveTrades(TradingBotOptions options) =>
+    options.LowRiskRollout.Enabled
+        ? Math.Min(IsBroker(options, "MT5") ? options.MT5.MaxActiveTrades : options.MaxActiveTrades, options.LowRiskRollout.MaxActiveTrades)
+        : IsBroker(options, "MT5") ? options.MT5.MaxActiveTrades : options.MaxActiveTrades;
+
+static async Task<Result<TradeTrackingCycleResult>> TrackClosedTradesAsync(
+    ServiceRegistry services,
+    CancellationToken cancellationToken)
+{
+    if (!IsBroker(services.Options, "MT5"))
+    {
+        return Result<TradeTrackingCycleResult>.Success(new TradeTrackingCycleResult(0, 0, services.Options.TradeTracking.Directory));
+    }
+
+    var to = DateTimeOffset.UtcNow;
+    var from = to.AddDays(-services.Options.TradeTracking.LookbackDays);
+    var trades = await services.MT5Bridge.GetClosedTradesAsync(from, to, cancellationToken);
+    if (!trades.IsSuccess)
+    {
+        return Result<TradeTrackingCycleResult>.Failure(trades.Error!);
+    }
+
+    var written = await services.TradeTracker.AppendAsync(trades.Value!, cancellationToken);
+    return Result<TradeTrackingCycleResult>.Success(new TradeTrackingCycleResult(
+        trades.Value!.Count,
+        written,
+        services.Options.TradeTracking.Directory));
 }
 
 static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
@@ -694,18 +1237,49 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
     bool showTokenRecoveryHint,
     CancellationToken cancellationToken)
 {
-    if (!services.Options.CTrader.IsDemo && !services.Options.CTrader.AllowLiveOrderCreation && !requireLiveConfirmation)
+    var cycleId = Guid.NewGuid().ToString("N");
+    await services.Monitor.WriteAsync(cycleId, "cycle_started", new
     {
+        requireLiveConfirmation,
+        formattedOutput,
+        analysisTimeUtc = DateTimeOffset.UtcNow,
+        maxActiveTrades = GetMaxActiveTrades(services.Options),
+        riskPercent = services.Options.RiskPercentPerTrade
+    }, cancellationToken);
+
+    if (IsBroker(services.Options, "MT5"))
+    {
+        if (!services.Options.MT5.AllowLiveOrderCreation && !requireLiveConfirmation)
+        {
+            await services.Monitor.WriteAsync(cycleId, "live_order_permission_rejected", new
+            {
+                reason = "MT5 order creation requires MT5:AllowLiveOrderCreation=true or confirm_live_order=true."
+            }, cancellationToken);
+            Console.Error.WriteLine("MT5 order creation requires MT5:AllowLiveOrderCreation=true or confirm_live_order=true.");
+            return 2;
+        }
+    }
+    else if (!services.Options.CTrader.IsDemo && !services.Options.CTrader.AllowLiveOrderCreation && !requireLiveConfirmation)
+    {
+        await services.Monitor.WriteAsync(cycleId, "live_order_permission_rejected", new
+        {
+            reason = "Live-environment order creation requires CTrader:AllowLiveOrderCreation=true or confirm_live_order=true."
+        }, cancellationToken);
         Console.Error.WriteLine("Live-environment order creation requires CTrader:AllowLiveOrderCreation=true or confirm_live_order=true.");
         return 2;
     }
 
-    var tokenResult = await RefreshCTraderTokenAsync(services, cancellationToken);
-    if (!tokenResult.IsSuccess)
+    var brokerResult = await PrepareConfiguredBrokerForMarketDataAsync(services, cancellationToken);
+    if (!brokerResult.IsSuccess)
     {
+        await services.Monitor.WriteAsync(cycleId, "broker_validation_failed", new
+        {
+            brokerResult.Error
+        }, cancellationToken);
+
         if (formattedOutput)
         {
-            PrintCycleHeader(new TradeSignal(
+            PrintCycleHeader(services.Options, new TradeSignal(
                 services.Options.Symbol,
                 TradeDirection.Buy,
                 0m,
@@ -714,29 +1288,50 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
                 0m,
                 SessionName.Closed,
                 false,
-                "cTrader token refresh failed."));
-            PrintFailure("Broker Token", tokenResult.Error!);
-            if (showTokenRecoveryHint)
+                "Broker session validation failed."));
+            PrintFailure("Broker Session", brokerResult.Error!);
+            if (!IsBroker(services.Options, "MT5") && showTokenRecoveryHint)
             {
-                PrintTokenRecoveryHint(tokenResult.Error!);
+                PrintTokenRecoveryHint(brokerResult.Error!);
             }
-            else
+            else if (!IsBroker(services.Options, "MT5"))
             {
                 PrintAuthorizationAlreadyRequested();
             }
         }
         else
         {
-            Console.Error.WriteLine(tokenResult.Error);
+            Console.Error.WriteLine(brokerResult.Error);
         }
 
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = brokerResult.Error,
+            exitCode = 3
+        }, cancellationToken);
         return 3;
     }
 
+    await services.Monitor.WriteAsync(cycleId, "broker_validation_succeeded", new { }, cancellationToken);
+
     var signal = await services.Strategy.AnalyzeAsync(services.Options.Symbol, DateTimeOffset.UtcNow, cancellationToken);
+    await services.Monitor.WriteAsync(cycleId, "strategy_analyzed", new
+    {
+        signal.Symbol,
+        direction = signal.Direction.ToString(),
+        session = signal.Session.ToString(),
+        signal.IsValidSetup,
+        signal.SetupReason,
+        signal.EntryPrice,
+        signal.StopLoss,
+        signal.TakeProfit,
+        signal.RiskReward
+    }, cancellationToken);
+
     if (formattedOutput)
     {
-        PrintCycleHeader(signal);
+        PrintCycleHeader(services.Options, signal);
     }
 
     if (!signal.IsValidSetup)
@@ -755,6 +1350,12 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
             }, new JsonSerializerOptions { WriteIndented = true }));
         }
 
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = signal.SetupReason,
+            exitCode = 1
+        }, cancellationToken);
         return 1;
     }
 
@@ -773,10 +1374,54 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
         0m,
         services.Options.RiskPercentPerTrade);
 
-    var account = new AccountSnapshot(services.Options.AccountBalance, services.Options.AccountBalance, 0m, 0m, 0, 0);
+    var accountSnapshot = await GetAccountSnapshotAsync(services, cancellationToken);
+    if (!accountSnapshot.IsSuccess)
+    {
+        await services.Monitor.WriteAsync(cycleId, "account_snapshot_failed", new
+        {
+            accountSnapshot.Error
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintFailure("Account Risk State", accountSnapshot.Error!);
+        }
+        else
+        {
+            Console.Error.WriteLine(accountSnapshot.Error);
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = accountSnapshot.Error,
+            exitCode = 4
+        }, cancellationToken);
+        return 4;
+    }
+
+    var account = accountSnapshot.Value!;
+    await services.Monitor.WriteAsync(cycleId, "account_snapshot_loaded", new
+    {
+        account.Balance,
+        account.Equity,
+        account.DailyRealizedProfitLoss,
+        account.WeeklyRealizedProfitLoss,
+        account.ConsecutiveLosses,
+        account.ConsecutiveLosingDays,
+        account.DailyStartingBalance,
+        account.InitialBalance,
+        account.TradingDays
+    }, cancellationToken);
+
     var riskDecision = services.Risk.Evaluate(order, account);
     if (!riskDecision.IsAllowed)
     {
+        await services.Monitor.WriteAsync(cycleId, "risk_rejected", new
+        {
+            riskDecision.Reason
+        }, cancellationToken);
+
         if (formattedOutput)
         {
             PrintRiskRejected(riskDecision);
@@ -791,17 +1436,64 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
             }, new JsonSerializerOptions { WriteIndented = true }));
         }
 
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = riskDecision.Reason,
+            exitCode = 1
+        }, cancellationToken);
         return 1;
     }
+
+    await services.Monitor.WriteAsync(cycleId, "risk_accepted", new
+    {
+        riskDecision.PositionSize,
+        riskDecision.Reason,
+        services.Options.RiskPercentPerTrade
+    }, cancellationToken);
 
     if (formattedOutput)
     {
         PrintRiskAccepted(riskDecision, services.Options.RiskPercentPerTrade);
     }
 
+    var marketGuard = await ValidateMarketExecutionGuardAsync(services, cycleId, formattedOutput, cancellationToken);
+    if (!marketGuard.IsSuccess)
+    {
+        if (!formattedOutput)
+        {
+            Console.Error.WriteLine(marketGuard.Error);
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = marketGuard.Error,
+            exitCode = 4
+        }, cancellationToken);
+        return 4;
+    }
+
+    var staleCleanup = await CleanupStalePendingOrdersAsync(services, cycleId, formattedOutput, cancellationToken);
+    if (!staleCleanup.IsSuccess)
+    {
+        if (!formattedOutput)
+        {
+            Console.Error.WriteLine(staleCleanup.Error);
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = staleCleanup.Error,
+            exitCode = 4
+        }, cancellationToken);
+        return 4;
+    }
+
     var activeTradeValidation = await ValidateActiveTradeLimitAsync(
         services,
-        tokenResult.Value!.AccessToken ?? services.Options.CTrader.AccessToken,
+        cycleId,
         formattedOutput,
         cancellationToken);
     if (!activeTradeValidation.IsSuccess)
@@ -811,20 +1503,24 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
             Console.Error.WriteLine(activeTradeValidation.Error);
         }
 
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = activeTradeValidation.Error,
+            exitCode = 4
+        }, cancellationToken);
         return 4;
     }
 
-    var orderResult = await services.CTraderJsonApi.CreateLimitOrderAsync(
-        signal.EntryPrice,
-        riskDecision.PositionSize,
-        signal.Direction,
-        signal.StopLoss,
-        signal.TakeProfit,
-        tokenResult.Value.AccessToken ?? services.Options.CTrader.AccessToken,
-        cancellationToken);
+    var orderResult = await CreateConfiguredBrokerOrderAsync(services, signal, riskDecision.PositionSize, cancellationToken);
 
     if (!orderResult.IsSuccess)
     {
+        await services.Monitor.WriteAsync(cycleId, "order_creation_failed", new
+        {
+            orderResult.Error
+        }, cancellationToken);
+
         if (formattedOutput)
         {
             PrintFailure("Order Creation", orderResult.Error!);
@@ -834,6 +1530,12 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
             Console.Error.WriteLine(orderResult.Error);
         }
 
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = orderResult.Error,
+            exitCode = 4
+        }, cancellationToken);
         return 4;
     }
 
@@ -843,6 +1545,7 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
     }
     else
     {
+        var createdOrder = orderResult.Value!;
         Console.WriteLine(JsonSerializer.Serialize(new
         {
             isOrderCreated = true,
@@ -855,22 +1558,120 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
             },
             order = new
             {
-                orderResult.Value!.IsAccepted,
-                orderResult.Value.ClientOrderId,
-                orderResult.Value.CtidTraderAccountId,
-                orderResult.Value.SymbolId,
-                orderResult.Value.TradeSide,
-                orderResult.Value.Volume,
-                orderResult.Value.LimitPrice,
-                orderResult.Value.StopLoss,
-                orderResult.Value.TakeProfit,
-                orderResult.Value.RiskReward,
-                execution = orderResult.Value.ExecutionPayload
+                isAccepted = true,
+                createdOrder.ClientOrderId,
+                createdOrder.BrokerOrderId,
+                createdOrder.AccountId,
+                createdOrder.SymbolId,
+                createdOrder.TradeSide,
+                lots = createdOrder.Lots,
+                createdOrder.Volume,
+                createdOrder.LimitPrice,
+                createdOrder.StopLoss,
+                createdOrder.TakeProfit,
+                createdOrder.RiskReward
             }
         }, new JsonSerializerOptions { WriteIndented = true }));
     }
 
+    await services.Monitor.WriteAsync(cycleId, "order_created", new
+    {
+        orderResult.Value!.ClientOrderId,
+        orderResult.Value.BrokerOrderId,
+        orderResult.Value.AccountId,
+        orderResult.Value.TradeSide,
+        orderResult.Value.Lots,
+        orderResult.Value.Volume,
+        orderResult.Value.LimitPrice,
+        orderResult.Value.StopLoss,
+        orderResult.Value.TakeProfit,
+        orderResult.Value.RiskReward
+    }, cancellationToken);
+
+    await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+    {
+        isOrderCreated = true,
+        exitCode = 0
+    }, cancellationToken);
+
     return 0;
+}
+
+static async Task<Result<BrokerOrderCreationResult>> CreateConfiguredBrokerOrderAsync(
+    ServiceRegistry services,
+    TradeSignal signal,
+    decimal lots,
+    CancellationToken cancellationToken)
+{
+    if (IsBroker(services.Options, "MT5"))
+    {
+        return await services.MT5Bridge.CreateLimitOrderAsync(signal, lots, cancellationToken);
+    }
+
+    var accessToken = services.Options.CTrader.AccessToken;
+    if (string.IsNullOrWhiteSpace(accessToken))
+    {
+        return Result<BrokerOrderCreationResult>.Failure("cTrader access token is required for order creation.");
+    }
+
+    var result = await services.CTraderJsonApi.CreateLimitOrderAsync(
+        signal.EntryPrice,
+        lots,
+        signal.Direction,
+        signal.StopLoss,
+        signal.TakeProfit,
+        accessToken,
+        cancellationToken);
+
+    if (!result.IsSuccess)
+    {
+        return Result<BrokerOrderCreationResult>.Failure(result.Error!);
+    }
+
+    var value = result.Value!;
+    return Result<BrokerOrderCreationResult>.Success(new BrokerOrderCreationResult(
+        value.ClientOrderId,
+        "",
+        value.CtidTraderAccountId,
+        value.SymbolId,
+        value.TradeSide,
+        lots,
+        value.Volume,
+        value.LimitPrice,
+        value.StopLoss,
+        value.TakeProfit,
+        value.RiskReward));
+}
+
+static async Task<Result<AccountSnapshot>> GetAccountSnapshotAsync(ServiceRegistry services, CancellationToken cancellationToken)
+{
+    if (IsBroker(services.Options, "MT5"))
+    {
+        var snapshot = await services.MT5Bridge.GetAccountSnapshotAsync(cancellationToken);
+        if (snapshot.IsSuccess && snapshot.Value!.InitialBalance <= 0m)
+        {
+            var value = snapshot.Value;
+            snapshot = Result<AccountSnapshot>.Success(value with
+            {
+                InitialBalance = services.Options.FTMOChallenge.InitialBalance > 0m
+                    ? services.Options.FTMOChallenge.InitialBalance
+                    : services.Options.AccountBalance
+            });
+        }
+
+        return snapshot;
+    }
+
+    return Result<AccountSnapshot>.Success(new AccountSnapshot(
+        services.Options.AccountBalance,
+        services.Options.AccountBalance,
+        0m,
+        0m,
+                0,
+                0,
+                services.Options.AccountBalance,
+                services.Options.FTMOChallenge.InitialBalance > 0m ? services.Options.FTMOChallenge.InitialBalance : services.Options.AccountBalance,
+                0));
 }
 
 static async Task<int> CTraderAuthorizeAsync(ServiceRegistry services, CancellationToken cancellationToken)
@@ -965,7 +1766,14 @@ static bool HasFlagArg(string[] args, string name, string expectedValue)
 }
 
 static bool HasStartOnceArg(string[] args) =>
-    args.Length == 2 && string.Equals(args[1], "once", StringComparison.OrdinalIgnoreCase);
+    args.Skip(1).Any(arg => string.Equals(arg, "once", StringComparison.OrdinalIgnoreCase));
+
+static bool IsTrackingMode(string[] args)
+{
+    var mode = ReadKeyValueArg(args, "mode");
+    return string.Equals(mode, "traking", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(mode, "tracking", StringComparison.OrdinalIgnoreCase);
+}
 
 static string? ReadKeyValueArg(string[] args, string name)
 {
@@ -977,12 +1785,13 @@ static string? ReadKeyValueArg(string[] args, string name)
 static int Help()
 {
     Console.WriteLine("Usage:");
-    PrintCommand("start [once]", "Runs cTrader connect, then runs analyze-and-createorder on the configured interval. Use 'start once' for one cycle.");
+    PrintCommand("start [once] [mode=traking|normal]", "Runs broker connect, then analyze-and-createorder on the configured interval. Use 'start once' for one cycle; mode=traking records closed trades to CSV.");
     PrintCommand("stop", "Logs a safe shutdown request. No daemon state is active yet.");
     PrintCommand("analyze", "Runs one Smart Money strategy analysis cycle and prints the generated signal.");
     PrintCommand("backtest --from 2025-05-15 --to 2026-05-15", "Runs a backtest from cTrader historical candles and writes a CSV report.");
     PrintCommand("backtest-learning --date 2026-05-19", "Scans one date for a valid setup and writes a learning chart plus PDF report.");
     PrintCommand("download-history --from 2025-05-15 --to 2026-05-15 timeframe=M5", "Downloads/caches historical candles from the configured backtesting provider.");
+    PrintCommand("find-signal [symbol=EURUSD]", "Captures TradingView 1h/5m/1m screenshots and reports a valid strategy signal when found.");
     PrintCommand("ctrader-connect", "Runs cTrader authorization and then verifies OAuth token connectivity.");
     PrintCommand("ctrader-authorize", "Starts the local OAuth callback, opens cTrader authorization, and saves tokens.");
     PrintCommand("ctrader-request-token", "Refreshes cTrader OAuth tokens and verifies token endpoint connectivity.");
@@ -991,6 +1800,10 @@ static int Help()
     PrintCommand("ctrader-account-details", "Authenticates the configured cTrader account and fetches account details.");
     PrintCommand("ctrader-symbols [symbol=EURUSD]", "Lists matching cTrader symbols and verifies the configured SymbolId.");
     PrintCommand("ctrader-createorder entry_point=[value] quantity=[value] [confirm_live_order=true]", "Creates a limit order with strategy-based stop loss and take profit.");
+    PrintCommand("mt5-test-connection", "Verifies connectivity with the configured local MT5 bridge.");
+    PrintCommand("mt5-account-details", "Fetches MT5 account details from the configured local bridge.");
+    PrintCommand("mt5-symbols [symbol=EURUSD]", "Fetches MT5 symbol metadata from the configured local bridge.");
+    PrintCommand("mt5-createorder entry_point=[value] quantity=[value] [confirm_live_order=true]", "Creates an MT5 limit order through the configured local bridge.");
     PrintCommand("analyze-and-createorder [confirm_live_order=true]", "Analyzes the configured strategy and creates an order only when a valid setup exists.");
     return 0;
 }
@@ -1001,12 +1814,13 @@ static void PrintCommand(string command, string description)
     Console.WriteLine($"      {description}");
 }
 
-static void PrintCycleHeader(TradeSignal signal)
+static void PrintCycleHeader(TradingBotOptions options, TradeSignal signal)
 {
     Console.WriteLine();
     Console.WriteLine("============================================================");
     Console.WriteLine($" TradingBot Analysis Cycle - {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
     Console.WriteLine("============================================================");
+    Console.WriteLine($"Broker : {options.Broker}");
     Console.WriteLine($"Symbol : {signal.Symbol}");
     Console.WriteLine($"Session: {signal.Session}");
 }
@@ -1048,7 +1862,39 @@ static void PrintRiskRejected(RiskDecision riskDecision)
     Console.WriteLine("Action       : No order created");
 }
 
-static void PrintActiveTradeSummary(CTraderActiveTradeSummary summary, int maxActiveTrades)
+static void PrintMarketExecutionGuard(MarketExecutionSnapshot snapshot, decimal maxSpreadPips, int maxSlippagePoints)
+{
+    Console.WriteLine();
+    Console.WriteLine("Market Guard : CHECKED");
+    Console.WriteLine($"Bid          : {snapshot.Bid}");
+    Console.WriteLine($"Ask          : {snapshot.Ask}");
+    Console.WriteLine($"Spread      : {decimal.Round(snapshot.SpreadPips, 2)} pips");
+    Console.WriteLine($"Max Spread  : {maxSpreadPips} pips");
+    Console.WriteLine($"Max Slippage: {maxSlippagePoints} points");
+}
+
+static void PrintStaleOrderCleanup(StaleOrderCleanupResult cleanup)
+{
+    Console.WriteLine();
+    Console.WriteLine("Stale Orders : CHECKED");
+    Console.WriteLine($"Checked      : {cleanup.CheckedOrders}");
+    Console.WriteLine($"Cancelled    : {cleanup.CancelledOrders}");
+    if (cleanup.CancelledOrders > 0)
+    {
+        Console.WriteLine($"Order IDs    : {string.Join(", ", cleanup.CancelledOrderIds)}");
+    }
+}
+
+static void PrintTradeTracking(int fetchedTrades, int writtenTrades, string directory)
+{
+    Console.WriteLine();
+    Console.WriteLine("Trade Tracking: CHECKED");
+    Console.WriteLine($"Fetched Closed: {fetchedTrades}");
+    Console.WriteLine($"New CSV Rows  : {writtenTrades}");
+    Console.WriteLine($"Directory     : {directory}");
+}
+
+static void PrintActiveTradeSummary(ActiveTradeSummary summary, int maxActiveTrades)
 {
     Console.WriteLine();
     Console.WriteLine("Active Trades: CHECKED");
@@ -1058,12 +1904,13 @@ static void PrintActiveTradeSummary(CTraderActiveTradeSummary summary, int maxAc
     Console.WriteLine($"Max Allowed  : {maxActiveTrades}");
 }
 
-static void PrintOrderCreated(CTraderCreateOrderResult orderResult, RiskDecision riskDecision)
+static void PrintOrderCreated(BrokerOrderCreationResult orderResult, RiskDecision riskDecision)
 {
     Console.WriteLine();
     Console.WriteLine("Order Status : CREATED");
     Console.WriteLine($"Client ID    : {orderResult.ClientOrderId}");
-    Console.WriteLine($"Account ID   : {orderResult.CtidTraderAccountId}");
+    Console.WriteLine($"Broker ID    : {orderResult.BrokerOrderId}");
+    Console.WriteLine($"Account ID   : {orderResult.AccountId}");
     Console.WriteLine($"Symbol ID    : {orderResult.SymbolId}");
     Console.WriteLine($"Side         : {orderResult.TradeSide}");
     Console.WriteLine($"Lots         : {riskDecision.PositionSize}");
@@ -1218,7 +2065,10 @@ static async Task SaveCTraderTokensAsync(string appsettingsPath, string accessTo
 {
     var json = await File.ReadAllTextAsync(appsettingsPath, cancellationToken);
     var root = JsonNode.Parse(json)?.AsObject() ?? throw new InvalidOperationException("Invalid appsettings.json.");
-    var cTrader = root["CTrader"]?.AsObject() ?? throw new InvalidOperationException("Missing CTrader section.");
+    var brokers = root["Brokers"]?.AsObject();
+    var cTrader = brokers?["CTrader"]?.AsObject()
+        ?? root["CTrader"]?.AsObject()
+        ?? throw new InvalidOperationException("Missing Brokers:CTrader section.");
 
     cTrader["AuthorizationCode"] = "";
     cTrader["AccessToken"] = accessToken;
@@ -1230,11 +2080,26 @@ static async Task SaveCTraderTokensAsync(string appsettingsPath, string accessTo
 internal sealed record ServiceRegistry(
     string AppsettingsPath,
     TradingBotOptions Options,
-    CTraderBrokerClient Broker,
+    IBrokerClient Broker,
     CTraderConnectionTester CTraderTester,
     CTraderJsonApiClient CTraderJsonApi,
+    MT5BridgeClient MT5Bridge,
     IHistoricalMarketDataProvider HistoricalMarketData,
     SmartMoneyStrategyEngine Strategy,
     RiskManager Risk,
     BacktestingEngine Backtesting,
-    CsvJournalWriter Journal);
+    CsvJournalWriter Journal,
+    OperationalLogWriter Monitor,
+    ClosedTradeTrackingWriter TradeTracker,
+    SignalTrackingWriter SignalTracker);
+
+internal sealed record TradeTrackingCycleResult(
+    int FetchedTrades,
+    int WrittenTrades,
+    string Directory);
+
+internal sealed record ScreenshotCaptureResult(
+    string Timeframe,
+    string Path,
+    bool IsCaptured,
+    string Message);

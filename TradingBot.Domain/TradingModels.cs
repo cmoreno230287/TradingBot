@@ -36,7 +36,10 @@ public sealed record AccountSnapshot(
     decimal DailyRealizedProfitLoss,
     decimal WeeklyRealizedProfitLoss,
     int ConsecutiveLosses,
-    int ConsecutiveLosingDays);
+    int ConsecutiveLosingDays,
+    decimal DailyStartingBalance = 0m,
+    decimal InitialBalance = 0m,
+    int TradingDays = 0);
 
 public sealed record RiskDecision(
     bool IsAllowed,
