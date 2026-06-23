@@ -83,7 +83,8 @@ public sealed record BacktestMetrics(
     decimal AverageRiskReward,
     int ConsecutiveLosses,
     int ConsecutiveWins,
-    decimal Expectancy);
+    decimal Expectancy,
+    int TotalValidSetups = 0);
 
 public sealed record BacktestResult(
     IReadOnlyList<TradeJournalEntry> Trades,

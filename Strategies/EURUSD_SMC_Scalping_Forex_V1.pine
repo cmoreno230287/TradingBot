@@ -1,0 +1,213 @@
+//@version=6
+strategy(
+     "EURUSD SMC Scalping Forex V1",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=100000,
+     currency=currency.USD,
+     commission_type=strategy.commission.cash_per_order,
+     commission_value=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     max_bars_back=500)
+
+// This script is intended for a 5-minute EURUSD chart. It mirrors the bot's
+// SmartMoneyStrategyEngine as closely as Pine allows:
+// H1 directional bias, M5 liquidity sweep, M5 MSS/BOS, M5 FVG, optional
+// premium/discount filter, optional displacement filter, and RR-based exits.
+
+// Strategy inputs matching TradingBot.CLI/appsettings.json defaults.
+useDailyBiasFilter = input.bool(false, "Use Daily Bias Filter")
+usePremiumDiscountFilter = input.bool(true, "Use Premium/Discount Filter")
+tradeOutKillZoneTime = input.bool(true, "Trade Outside Kill Zones")
+
+biasSwingStrength = input.int(2, "Bias Swing Strength", minval=1)
+setupLookbackCandlesM5 = input.int(96, "M5 Setup Lookback Candles", minval=10)
+liquiditySweepLookbackCandles = input.int(24, "Liquidity Sweep Lookback Candles", minval=3)
+maxSetupAgeCandlesM5 = input.int(12, "Max Setup Age Candles M5", minval=1)
+
+minFvgSizePips = input.float(1.0, "Minimum FVG Size Pips", minval=0.0, step=0.1)
+preferredRiskReward = input.float(3.0, "Preferred Risk Reward", minval=0.1, step=0.1)
+minRiskReward = input.float(2.0, "Minimum Risk Reward", minval=0.1, step=0.1)
+normalStopLossBufferPips = input.float(2.0, "Normal SL Buffer Pips", minval=0.0, step=0.1)
+pipSize = input.float(0.0001, "Pip Size", minval=0.00001, step=0.00001)
+
+fvgEntryMode = input.string("Dynamic", "FVG Entry Mode", options=["Dynamic", "Boundary"])
+requireDisplacement = input.bool(true, "Require Displacement")
+displacementMinBodyToRangeRatio = input.float(0.60, "Displacement Body/Range Ratio", minval=0.0, maxval=1.0, step=0.05)
+displacementAtrMultiplier = input.float(1.20, "Displacement Range Multiplier", minval=0.1, step=0.1)
+
+londonKillZone = input.session("0200-0500", "London Kill Zone NY")
+newYorkKillZone = input.session("0830-1100", "New York Kill Zone NY")
+overlapKillZone = input.session("0800-1100", "London/New York Overlap NY")
+sessionTimezone = input.string("America/New_York", "Session Timezone")
+
+showSignals = input.bool(true, "Show Signal Labels")
+showFvg = input.bool(true, "Show FVG Levels")
+showBiasTable = input.bool(true, "Show Bias Table")
+
+// Bias model: same shape as the C# engine.
+// Returns 1 bullish, -1 bearish, 0 neutral.
+f_bias(int strength) =>
+    ph = ta.pivothigh(high, strength, strength)
+    pl = ta.pivotlow(low, strength, strength)
+    sh0 = ta.valuewhen(not na(ph), ph, 0)
+    sh1 = ta.valuewhen(not na(ph), ph, 1)
+    sl0 = ta.valuewhen(not na(pl), pl, 0)
+    sl1 = ta.valuewhen(not na(pl), pl, 1)
+    swingReady = not na(sh0) and not na(sh1) and not na(sl0) and not na(sl1)
+    swingBias = swingReady ? ((sh0 > sh1 and sl0 > sl1) ? 1 : (sh0 < sh1 and sl0 < sl1) ? -1 : 0) : 0
+    closeBias = (close > close[1] and close[1] > close[2]) ? 1 : (close < close[1] and close[1] < close[2]) ? -1 : 0
+    swingBias != 0 ? swingBias : closeBias
+
+f_priorLow(int barsAgo, int lookback) =>
+    float result = na
+    for offset = 1 to lookback
+        result := na(result) ? low[barsAgo + offset] : math.min(result, low[barsAgo + offset])
+    result
+
+f_priorHigh(int barsAgo, int lookback) =>
+    float result = na
+    for offset = 1 to lookback
+        result := na(result) ? high[barsAgo + offset] : math.max(result, high[barsAgo + offset])
+    result
+
+f_averageRangeBefore(int barsAgo, int lookback) =>
+    float total = 0.0
+    int count = 0
+    for offset = 1 to lookback
+        candleRange = high[barsAgo + offset] - low[barsAgo + offset]
+        if not na(candleRange)
+            total += candleRange
+            count += 1
+    count == 0 ? na : total / count
+
+f_hasDisplacement(int barsAgo, int lookback) =>
+    candleRange = high[barsAgo] - low[barsAgo]
+    body = math.abs(close[barsAgo] - open[barsAgo])
+    bodyToRange = candleRange == 0.0 ? 0.0 : body / candleRange
+    avgRange = f_averageRangeBefore(barsAgo, lookback)
+    not na(avgRange) and bodyToRange >= displacementMinBodyToRangeRatio and candleRange >= avgRange * displacementAtrMultiplier
+
+f_inKillZone() =>
+    inLondon = not na(time(timeframe.period, londonKillZone, sessionTimezone))
+    inNewYork = not na(time(timeframe.period, newYorkKillZone, sessionTimezone))
+    inOverlap = not na(time(timeframe.period, overlapKillZone, sessionTimezone))
+    inLondon or inNewYork or inOverlap
+
+h1Bias = request.security(syminfo.tickerid, "60", f_bias(biasSwingStrength), barmerge.gaps_off, barmerge.lookahead_off)
+d1Bias = request.security(syminfo.tickerid, "D", f_bias(biasSwingStrength), barmerge.gaps_off, barmerge.lookahead_off)
+
+directionalBias = useDailyBiasFilter ? (d1Bias != 0 and h1Bias != 0 and d1Bias == h1Bias ? d1Bias : 0) : h1Bias
+isBuyBias = directionalBias == 1
+isSellBias = directionalBias == -1
+
+killZoneOk = tradeOutKillZoneTime or f_inKillZone()
+enoughBars = bar_index > setupLookbackCandlesM5 + liquiditySweepLookbackCandles + 5
+
+float setupEntry = na
+float setupStop = na
+float setupTarget = na
+float setupFvgLow = na
+float setupFvgHigh = na
+string setupReason = ""
+bool validSetup = false
+
+if enoughBars and killZoneOk and directionalBias != 0
+    for sweepBarsAgo = 0 to maxSetupAgeCandlesM5
+        if not validSetup
+            priorLow = f_priorLow(sweepBarsAgo, liquiditySweepLookbackCandles)
+            priorHigh = f_priorHigh(sweepBarsAgo, liquiditySweepLookbackCandles)
+            buySweep = isBuyBias and not na(priorLow) and low[sweepBarsAgo] < priorLow and close[sweepBarsAgo] > priorLow
+            sellSweep = isSellBias and not na(priorHigh) and high[sweepBarsAgo] > priorHigh and close[sweepBarsAgo] < priorHigh
+            sweptPrice = buySweep ? low[sweepBarsAgo] : sellSweep ? high[sweepBarsAgo] : na
+            breakLevel = buySweep ? priorHigh : sellSweep ? priorLow : na
+
+            if (buySweep or sellSweep) and sweepBarsAgo > 0
+                int structureBarsAgo = na
+                for reverseOffset = 0 to sweepBarsAgo - 1
+                    checkBarsAgo = sweepBarsAgo - 1 - reverseOffset
+                    if na(structureBarsAgo)
+                        brokeStructure = buySweep ? close[checkBarsAgo] > breakLevel : close[checkBarsAgo] < breakLevel
+                        if brokeStructure
+                            structureBarsAgo := checkBarsAgo
+
+                if not na(structureBarsAgo)
+                    displacementOk = not requireDisplacement or f_hasDisplacement(structureBarsAgo, liquiditySweepLookbackCandles)
+                    if displacementOk
+                        float fvgLow = na
+                        float fvgHigh = na
+                        int fvgBarsAgo = na
+                        for candidateBarsAgo = 0 to structureBarsAgo
+                            if na(fvgBarsAgo)
+                                bullFvg = buySweep and low[candidateBarsAgo] > high[candidateBarsAgo + 2]
+                                bearFvg = sellSweep and high[candidateBarsAgo] < low[candidateBarsAgo + 2]
+                                if bullFvg
+                                    fvgLow := high[candidateBarsAgo + 2]
+                                    fvgHigh := low[candidateBarsAgo]
+                                    fvgBarsAgo := candidateBarsAgo
+                                if bearFvg
+                                    fvgLow := high[candidateBarsAgo]
+                                    fvgHigh := low[candidateBarsAgo + 2]
+                                    fvgBarsAgo := candidateBarsAgo
+
+                        fvgSizeOk = not na(fvgBarsAgo) and (fvgHigh - fvgLow) >= pipSize * minFvgSizePips
+                        if fvgSizeOk
+                            entry = fvgEntryMode == "Boundary" ? (buySweep ? fvgLow : fvgHigh) : (fvgLow + fvgHigh) / 2.0
+                            dealingRangeHigh = ta.highest(high, setupLookbackCandlesM5)
+                            dealingRangeLow = ta.lowest(low, setupLookbackCandlesM5)
+                            equilibrium = (dealingRangeHigh + dealingRangeLow) / 2.0
+                            premiumDiscountOk = not usePremiumDiscountFilter or (buySweep ? entry <= equilibrium : entry >= equilibrium)
+
+                            if premiumDiscountOk
+                                stop = buySweep ? sweptPrice - pipSize * normalStopLossBufferPips : sweptPrice + pipSize * normalStopLossBufferPips
+                                risk = math.abs(entry - stop)
+                                target = buySweep ? entry + risk * preferredRiskReward : entry - risk * preferredRiskReward
+                                rr = risk == 0.0 ? 0.0 : math.abs(target - entry) / risk
+                                if rr >= minRiskReward
+                                    setupEntry := entry
+                                    setupStop := stop
+                                    setupTarget := target
+                                    setupFvgLow := fvgLow
+                                    setupFvgHigh := fvgHigh
+                                    setupReason := buySweep ? "Sell-side liquidity sweep + MSS/BOS + buy FVG" : "Buy-side liquidity sweep + MSS/BOS + sell FVG"
+                                    validSetup := true
+
+longSignal = validSetup and isBuyBias
+shortSignal = validSetup and isSellBias
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("SMC Long", strategy.long, limit=setupEntry, comment=setupReason)
+    strategy.exit("SMC Long TP/SL", "SMC Long", stop=setupStop, limit=setupTarget)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("SMC Short", strategy.short, limit=setupEntry, comment=setupReason)
+    strategy.exit("SMC Short TP/SL", "SMC Short", stop=setupStop, limit=setupTarget)
+
+plot(showFvg ? setupFvgLow : na, "FVG Lower", color=color.new(color.teal, 0), style=plot.style_linebr)
+plot(showFvg ? setupFvgHigh : na, "FVG Upper", color=color.new(color.orange, 0), style=plot.style_linebr)
+plot(setupEntry, "Entry", color=color.new(color.white, 0), style=plot.style_linebr)
+plot(setupStop, "Stop Loss", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(setupTarget, "Take Profit", color=color.new(color.green, 0), style=plot.style_linebr)
+
+plotshape(showSignals and longSignal, title="Valid Buy Setup", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="BUY")
+plotshape(showSignals and shortSignal, title="Valid Sell Setup", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SELL")
+
+alertcondition(longSignal, "EURUSD SMC Buy Setup", "EURUSD SMC Scalping Forex V1: valid BUY setup")
+alertcondition(shortSignal, "EURUSD SMC Sell Setup", "EURUSD SMC Scalping Forex V1: valid SELL setup")
+
+var table biasTable = table.new(position.top_right, 2, 5, border_width=1)
+if barstate.islast and showBiasTable
+    table.cell(biasTable, 0, 0, "Metric", text_color=color.white, bgcolor=color.gray)
+    table.cell(biasTable, 1, 0, "Value", text_color=color.white, bgcolor=color.gray)
+    table.cell(biasTable, 0, 1, "H1 Bias")
+    table.cell(biasTable, 1, 1, h1Bias == 1 ? "Bullish" : h1Bias == -1 ? "Bearish" : "Neutral")
+    table.cell(biasTable, 0, 2, "D1 Bias")
+    table.cell(biasTable, 1, 2, d1Bias == 1 ? "Bullish" : d1Bias == -1 ? "Bearish" : "Neutral")
+    table.cell(biasTable, 0, 3, "Kill Zone")
+    table.cell(biasTable, 1, 3, f_inKillZone() ? "YES" : "NO")
+    table.cell(biasTable, 0, 4, "Last Setup")
+    table.cell(biasTable, 1, 4, validSetup ? setupReason : "None")
+
+if barstate.islast and timeframe.period != "5"
+    label.new(bar_index, high, "Use this strategy on a 5-minute chart.", style=label.style_label_down, color=color.yellow, textcolor=color.black)

@@ -86,4 +86,5 @@ public sealed record TradeSignal(
     SessionName Session,
     bool IsValidSetup,
     string SetupReason,
-    FairValueGap? FairValueGap = null);
+    FairValueGap? FairValueGap = null,
+    string? SetupId = null);

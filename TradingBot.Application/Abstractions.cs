@@ -88,21 +88,6 @@ public sealed record ClosedTradeReport(
     long MagicNumber,
     string Comment);
 
-public sealed record SignalReport(
-    string SignalId,
-    string Symbol,
-    string Session,
-    string Direction,
-    decimal EntryPrice,
-    decimal StopLossPrice,
-    decimal TakeProfitPrice,
-    decimal RiskRewardRatio,
-    DateTimeOffset CreatedAt,
-    string SetupReason,
-    string ScreenshotH1,
-    string ScreenshotM5,
-    string ScreenshotM1);
-
 public interface IBrokerClient
 {
     Task<Result> ValidateConnectionAsync(CancellationToken cancellationToken);

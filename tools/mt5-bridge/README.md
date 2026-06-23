@@ -56,5 +56,5 @@ dotnet run --project TradingBot.CLI -- mt5-symbols symbol=EURUSD
 
 - The bridge uses the account already logged into the MT5 terminal.
 - Order creation is still controlled by `TradingBot.CLI/appsettings.json`.
-- Pending orders use the `MT5:PendingOrderExpirationMinutes` value sent by the bot.
+- Pending orders use the `MT5:PendingOrderExpirationHours` value sent by the bot. The default is 12 hours.
 - Keep `MT5:AllowLiveOrderCreation` as `false` until connection, account, symbols, candles, and active trade checks pass.
