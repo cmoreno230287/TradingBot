@@ -6,10 +6,10 @@ public sealed class RiskManager(TradingBotOptions options) : IRiskManager
 {
     public RiskDecision Evaluate(OrderRequest request, AccountSnapshot account)
     {
-        var ftmoDecision = EvaluateFtmoChallengeRules(account);
-        if (!ftmoDecision.IsAllowed)
+        var fundedAccountDecision = EvaluateFundedAccountChallengeRules(account);
+        if (!fundedAccountDecision.IsAllowed)
         {
-            return ftmoDecision;
+            return fundedAccountDecision;
         }
 
         if (request.RiskPercent <= 0 || request.RiskPercent > options.MaxRiskPercentPerTrade)
@@ -19,7 +19,7 @@ public sealed class RiskManager(TradingBotOptions options) : IRiskManager
 
         if (account.ConsecutiveLosses >= options.MaxConsecutiveLosses)
         {
-            return new RiskDecision(false, 0m, "Max consecutive losses reached.");
+            return new RiskDecision(false, 0m, "Max consecutive losses reached for the current trading day.");
         }
 
         if (account.ConsecutiveLosingDays >= options.MaxConsecutiveLosingDays)
@@ -51,19 +51,20 @@ public sealed class RiskManager(TradingBotOptions options) : IRiskManager
         return new RiskDecision(true, decimal.Round(lots, 2), "Risk accepted.");
     }
 
-    private RiskDecision EvaluateFtmoChallengeRules(AccountSnapshot account)
+    private RiskDecision EvaluateFundedAccountChallengeRules(AccountSnapshot account)
     {
-        if (!options.FTMOChallenge.Enabled)
+        var challenge = options.ActiveFundedAccountChallenge;
+        if (challenge is null || !challenge.Enabled)
         {
-            return new RiskDecision(true, 0m, "FTMO challenge guard is disabled.");
+            return new RiskDecision(true, 0m, "Funded account challenge guard is disabled.");
         }
 
         var initialBalance = account.InitialBalance > 0m
             ? account.InitialBalance
-            : options.FTMOChallenge.InitialBalance > 0m ? options.FTMOChallenge.InitialBalance : account.Balance;
+            : challenge.InitialBalance > 0m ? challenge.InitialBalance : account.Balance;
         if (initialBalance <= 0m)
         {
-            return new RiskDecision(false, 0m, "FTMO initial balance is invalid.");
+            return new RiskDecision(false, 0m, "Funded account challenge initial balance is invalid.");
         }
 
         var dailyStartingBalance = account.DailyStartingBalance > 0m
@@ -71,41 +72,41 @@ public sealed class RiskManager(TradingBotOptions options) : IRiskManager
             : account.Balance - account.DailyRealizedProfitLoss;
         var dailyLossAmount = Math.Max(0m, dailyStartingBalance - account.Equity);
         var maxDailyLossAmount = ResolveAmountLimit(
-            options.FTMOChallenge.MaxDailyLossAmount,
-            options.FTMOChallenge.MaxDailyLossPercent,
-            options.FTMOChallenge.DailyLossSafetyBufferAmount,
-            options.FTMOChallenge.DailyLossSafetyBufferPercent,
+            challenge.MaxDailyLossAmount,
+            challenge.MaxDailyLossPercent,
+            challenge.DailyLossSafetyBufferAmount,
+            challenge.DailyLossSafetyBufferPercent,
             initialBalance);
         if (maxDailyLossAmount > 0m && dailyLossAmount >= maxDailyLossAmount)
         {
-            return new RiskDecision(false, 0m, $"FTMO daily loss guard reached. DailyLoss={decimal.Round(dailyLossAmount, 2)}, Limit={decimal.Round(maxDailyLossAmount, 2)}.");
+            return new RiskDecision(false, 0m, $"{challenge.Name} daily loss guard reached. DailyLoss={decimal.Round(dailyLossAmount, 2)}, Limit={decimal.Round(maxDailyLossAmount, 2)}.");
         }
 
         var totalLossAmount = Math.Max(0m, initialBalance - account.Equity);
         var maxTotalLossAmount = ResolveAmountLimit(
-            options.FTMOChallenge.MaxTotalLossAmount,
-            options.FTMOChallenge.MaxTotalLossPercent,
-            options.FTMOChallenge.TotalLossSafetyBufferAmount,
-            options.FTMOChallenge.TotalLossSafetyBufferPercent,
+            challenge.MaxTotalLossAmount,
+            challenge.MaxTotalLossPercent,
+            challenge.TotalLossSafetyBufferAmount,
+            challenge.TotalLossSafetyBufferPercent,
             initialBalance);
         if (maxTotalLossAmount > 0m && totalLossAmount >= maxTotalLossAmount)
         {
-            return new RiskDecision(false, 0m, $"FTMO total loss guard reached. TotalLoss={decimal.Round(totalLossAmount, 2)}, Limit={decimal.Round(maxTotalLossAmount, 2)}.");
+            return new RiskDecision(false, 0m, $"{challenge.Name} total loss guard reached. TotalLoss={decimal.Round(totalLossAmount, 2)}, Limit={decimal.Round(maxTotalLossAmount, 2)}.");
         }
 
         var profitTargetAmount = ResolveAmountLimit(
-            options.FTMOChallenge.ProfitTargetAmount,
-            options.FTMOChallenge.ProfitTargetPercent,
-            options.FTMOChallenge.StopTradingAtProfitTargetBufferAmount,
-            options.FTMOChallenge.StopTradingAtProfitTargetBufferPercent,
+            challenge.ProfitTargetAmount,
+            challenge.ProfitTargetPercent,
+            challenge.StopTradingAtProfitTargetBufferAmount,
+            challenge.StopTradingAtProfitTargetBufferPercent,
             initialBalance);
         var currentProfit = account.Equity - initialBalance;
         if (profitTargetAmount > 0m && currentProfit >= profitTargetAmount)
         {
-            return new RiskDecision(false, 0m, $"FTMO profit target guard reached. Profit={decimal.Round(currentProfit, 2)}, Target={decimal.Round(profitTargetAmount, 2)}.");
+            return new RiskDecision(false, 0m, $"{challenge.Name} profit target guard reached. Profit={decimal.Round(currentProfit, 2)}, Target={decimal.Round(profitTargetAmount, 2)}.");
         }
 
-        return new RiskDecision(true, 0m, "FTMO challenge guard accepted.");
+        return new RiskDecision(true, 0m, $"{challenge.Name} challenge guard accepted.");
     }
 
     private static decimal ResolveAmountLimit(

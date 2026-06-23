@@ -4,7 +4,7 @@ using TradingBot.Domain;
 namespace TradingBot.Backtesting;
 
 public sealed class BacktestingEngine(
-    IStrategyEngine strategyEngine,
+    Func<IMarketDataProvider, IStrategyEngine> strategyFactory,
     IRiskManager riskManager,
     IHistoricalMarketDataProvider historicalMarketDataProvider,
     IHistoricalTickDataProvider? historicalTickDataProvider,
@@ -15,12 +15,24 @@ public sealed class BacktestingEngine(
         var historicalCandles = await PreloadHistoricalCandlesAsync(symbol, from, to, cancellationToken);
         if (historicalCandles[Timeframe.M5].Count == 0)
         {
-            throw new InvalidOperationException($"Historical data provider '{options.Backtesting.DataSource}' returned no M5 candles for {symbol}.");
+            throw new InvalidOperationException($"Historical data provider '{options.ActiveBacktestingDataSource.DataSource}' returned no M5 candles for {symbol}.");
         }
 
+        var simulationTimeframe = ResolveSimulationTimeframe();
+        if (!historicalCandles.TryGetValue(simulationTimeframe, out var simulationCandles) || simulationCandles.Count == 0)
+        {
+            throw new InvalidOperationException($"Historical data provider '{options.ActiveBacktestingDataSource.DataSource}' returned no {simulationTimeframe} candles for {symbol}.");
+        }
+
+        ValidateBacktestCoverage(historicalCandles, from, simulationTimeframe);
+
+        var strategyEngine = strategyFactory(new HistoricalBacktestMarketDataProvider(historicalCandles));
         var trades = new List<TradeJournalEntry>();
-        var balance = options.AccountBalance;
-        var initialBalance = options.FTMOChallenge.InitialBalance > 0m ? options.FTMOChallenge.InitialBalance : options.AccountBalance;
+        var seenSetups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var validSetups = 0;
+        var challengeInitialBalance = options.ActiveFundedAccountChallenge?.InitialBalance ?? 0m;
+        var initialBalance = challengeInitialBalance > 0m ? challengeInitialBalance : options.AccountBalance;
+        var balance = initialBalance;
 
         for (var cursor = from; cursor <= to; cursor = cursor.AddMinutes(5))
         {
@@ -30,6 +42,18 @@ public sealed class BacktestingEngine(
                 continue;
             }
 
+            if (HasActiveTradeAt(trades, cursor))
+            {
+                continue;
+            }
+
+            var setupKey = BuildSetupKey(signal);
+            if (!seenSetups.Add(setupKey))
+            {
+                continue;
+            }
+
+            validSetups++;
             var order = new OrderRequest(
                 signal.Symbol,
                 signal.Direction,
@@ -47,8 +71,14 @@ public sealed class BacktestingEngine(
                 continue;
             }
 
-            var outcome = await SimulateTradeOutcomeAsync(signal, historicalCandles[Timeframe.M5], cursor, account.Balance, cancellationToken);
+            var signalTime = ResolveSignalTime(signal, cursor);
+            var outcome = await SimulateTradeOutcomeAsync(signal, simulationCandles, simulationTimeframe, signalTime, account.Balance, cancellationToken);
             if (outcome.Status is TradeOutcomeStatus.Open or TradeOutcomeStatus.Cancelled)
+            {
+                continue;
+            }
+
+            if (HasOverlappingTrade(trades, outcome.OpenedAt, outcome.ClosedAt))
             {
                 continue;
             }
@@ -76,7 +106,7 @@ public sealed class BacktestingEngine(
             });
         }
 
-        return new BacktestResult(trades, CalculateMetrics(trades));
+        return new BacktestResult(trades, CalculateMetrics(trades, validSetups));
     }
 
     private AccountSnapshot BuildBacktestAccountSnapshot(
@@ -99,29 +129,63 @@ public sealed class BacktestingEngine(
             balance,
             dailyProfitLoss,
             weeklyProfitLoss,
-            LongestTrailingStreak(trades, winning: false),
+            ConsecutiveLossesForDate(trades, cursor.Date),
             ConsecutiveLosingDaysToDate(trades, cursor),
             balance - dailyProfitLoss,
             initialBalance,
             TradingDaysToDate(trades, cursor));
     }
 
+    private static string BuildSetupKey(TradeSignal signal)
+    {
+        if (!string.IsNullOrWhiteSpace(signal.SetupId))
+        {
+            return signal.SetupId;
+        }
+
+        return string.Join('|', signal.Symbol, signal.Direction, signal.EntryPrice, signal.StopLoss, signal.TakeProfit, signal.SetupReason);
+    }
+
+    private bool HasActiveTradeAt(IReadOnlyList<TradeJournalEntry> trades, DateTimeOffset cursor) =>
+        options.MaxActiveTrades > 0
+        && trades.Count(trade => trade.OpenedAt <= cursor && (!trade.ClosedAt.HasValue || trade.ClosedAt.Value > cursor)) >= options.MaxActiveTrades;
+
+    private bool HasOverlappingTrade(IReadOnlyList<TradeJournalEntry> trades, DateTimeOffset openedAt, DateTimeOffset? closedAt) =>
+        options.MaxActiveTrades > 0
+        && trades.Count(trade => IntervalsOverlap(trade.OpenedAt, trade.ClosedAt, openedAt, closedAt)) >= options.MaxActiveTrades;
+
+    private static bool IntervalsOverlap(DateTimeOffset leftOpen, DateTimeOffset? leftClose, DateTimeOffset rightOpen, DateTimeOffset? rightClose)
+    {
+        var leftEnd = leftClose ?? DateTimeOffset.MaxValue;
+        var rightEnd = rightClose ?? DateTimeOffset.MaxValue;
+        return leftOpen < rightEnd && rightOpen < leftEnd;
+    }
+
     private async Task<SimulatedTradeOutcome> SimulateTradeOutcomeAsync(
         TradeSignal signal,
-        IReadOnlyList<Candle> m5Candles,
+        IReadOnlyList<Candle> candles,
+        Timeframe timeframe,
         DateTimeOffset signalTime,
         decimal accountBalance,
         CancellationToken cancellationToken)
     {
-        var expirationTime = signalTime.AddMinutes(options.PendingOrderExpirationCandlesM5 * 5);
+        var expirationTime = signalTime.AddMinutes(ResolveExpirationMinutes(timeframe));
         if (historicalTickDataProvider is not null)
         {
-            var tickOutcome = await SimulateTradeOutcomeFromTicksAsync(
-                signal,
-                signalTime,
-                expirationTime,
-                accountBalance,
-                cancellationToken);
+            SimulatedTradeOutcome tickOutcome;
+            try
+            {
+                tickOutcome = await SimulateTradeOutcomeFromTicksAsync(
+                    signal,
+                    signalTime,
+                    expirationTime,
+                    accountBalance,
+                    cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                tickOutcome = new SimulatedTradeOutcome(TradeOutcomeStatus.Open, signalTime, null, 0m, $"TicksUnavailable:{exception.Message}");
+            }
 
             if (tickOutcome.Status != TradeOutcomeStatus.Open)
             {
@@ -129,7 +193,7 @@ public sealed class BacktestingEngine(
             }
         }
 
-        var futureCandles = m5Candles
+        var futureCandles = candles
             .Where(candle => candle.OpenedAt >= signalTime && candle.OpenedAt <= expirationTime)
             .OrderBy(candle => candle.OpenedAt)
             .ToArray();
@@ -139,7 +203,7 @@ public sealed class BacktestingEngine(
             return new SimulatedTradeOutcome(TradeOutcomeStatus.Cancelled, signalTime, expirationTime, 0m, "Candles");
         }
 
-        var monitoringCandles = m5Candles
+        var monitoringCandles = candles
             .Where(candle => candle.OpenedAt >= fillCandle.OpenedAt)
             .OrderBy(candle => candle.OpenedAt);
         var riskAmount = accountBalance * (options.RiskPercentPerTrade / 100m);
@@ -232,6 +296,51 @@ public sealed class BacktestingEngine(
             ? tick.Bid >= signal.TakeProfit
             : tick.Ask <= signal.TakeProfit;
 
+    private Timeframe ResolveSimulationTimeframe() =>
+        string.Equals(options.ActiveStrategy.ExecutionTimeframe, "M1", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(options.ActiveStrategy.EntryTimeframe, "M1", StringComparison.OrdinalIgnoreCase)
+            ? Timeframe.M1
+            : Timeframe.M5;
+
+    private static DateTimeOffset ResolveSignalTime(TradeSignal signal, DateTimeOffset cursor) =>
+        signal.FairValueGap?.CreatedAt is { } createdAt && createdAt < cursor
+            ? createdAt
+            : cursor;
+
+    private int ResolveExpirationMinutes(Timeframe timeframe) =>
+        timeframe == Timeframe.M1
+            ? options.PendingOrderExpirationCandlesM1
+            : options.PendingOrderExpirationCandlesM5 * 5;
+
+    private void ValidateBacktestCoverage(
+        IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>> candles,
+        DateTimeOffset requestedFrom,
+        Timeframe simulationTimeframe)
+    {
+        ValidateTimeframeCoverage(candles, Timeframe.M5, requestedFrom, TimeSpan.FromMinutes(5));
+        ValidateTimeframeCoverage(candles, simulationTimeframe, requestedFrom, TimeSpan.FromMinutes(simulationTimeframe == Timeframe.M1 ? 1 : 5));
+    }
+
+    private void ValidateTimeframeCoverage(
+        IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>> candles,
+        Timeframe timeframe,
+        DateTimeOffset requestedFrom,
+        TimeSpan tolerance)
+    {
+        if (!candles.TryGetValue(timeframe, out var timeframeCandles) || timeframeCandles.Count == 0)
+        {
+            throw new InvalidOperationException($"Backtest cannot start at {requestedFrom:O}: no {timeframe} candles were loaded.");
+        }
+
+        var first = timeframeCandles[0].OpenedAt;
+        if (first > requestedFrom.Add(tolerance))
+        {
+            throw new InvalidOperationException(
+                $"Backtest requested from {requestedFrom:O}, but {options.ActiveBacktestingDataSource.DataSource} {timeframe} data starts at {first:O}. " +
+                $"Download/import {timeframe} history for the requested period or start the backtest at/after {first:yyyy-MM-dd HH:mm:ss zzz}.");
+        }
+    }
+
     private async Task<IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>>> PreloadHistoricalCandlesAsync(
         string symbol,
         DateTimeOffset from,
@@ -239,21 +348,27 @@ public sealed class BacktestingEngine(
         CancellationToken cancellationToken)
     {
         var result = new Dictionary<Timeframe, IReadOnlyList<Candle>>();
-        foreach (var timeframe in new[] { Timeframe.D1, Timeframe.H1, Timeframe.M5 })
-        {
-            result[timeframe] = await historicalMarketDataProvider.GetCandlesAsync(
-                new HistoricalDataRequest(symbol, timeframe, from, to),
-                cancellationToken);
-        }
+        result[Timeframe.D1] = await historicalMarketDataProvider.GetCandlesAsync(
+            new HistoricalDataRequest(symbol, Timeframe.D1, from.AddDays(-60), to),
+            cancellationToken);
+        result[Timeframe.H1] = await historicalMarketDataProvider.GetCandlesAsync(
+            new HistoricalDataRequest(symbol, Timeframe.H1, from.AddDays(-10), to),
+            cancellationToken);
+        result[Timeframe.M1] = await historicalMarketDataProvider.GetCandlesAsync(
+            new HistoricalDataRequest(symbol, Timeframe.M1, from.AddHours(-6), to),
+            cancellationToken);
+        result[Timeframe.M5] = await historicalMarketDataProvider.GetCandlesAsync(
+            new HistoricalDataRequest(symbol, Timeframe.M5, from.AddHours(-12), to),
+            cancellationToken);
 
         return result;
     }
 
-    public static BacktestMetrics CalculateMetrics(IReadOnlyList<TradeJournalEntry> trades)
+    public static BacktestMetrics CalculateMetrics(IReadOnlyList<TradeJournalEntry> trades, int validSetups = 0)
     {
         if (trades.Count == 0)
         {
-            return new BacktestMetrics(0, 0m, 0m, 0m, 0m, 0, 0, 0m);
+            return new BacktestMetrics(0, 0m, 0m, 0m, 0m, 0, 0, 0m, validSetups);
         }
 
         var wins = trades.Count(t => t.ProfitLossAmount > 0);
@@ -281,7 +396,8 @@ public sealed class BacktestingEngine(
             decimal.Round(trades.Average(t => t.RiskRewardRatio), 2),
             LongestStreak(trades, false),
             LongestStreak(trades, true),
-            decimal.Round(expectancy, 2));
+            decimal.Round(expectancy, 2),
+            validSetups);
     }
 
     private static int LongestStreak(IEnumerable<TradeJournalEntry> trades, bool winning)
@@ -298,18 +414,23 @@ public sealed class BacktestingEngine(
         return best;
     }
 
-    private static int LongestTrailingStreak(IEnumerable<TradeJournalEntry> trades, bool winning)
+    private static int ConsecutiveLossesForDate(IEnumerable<TradeJournalEntry> trades, DateTime date)
     {
         var count = 0;
-        foreach (var trade in trades.OrderByDescending(trade => trade.ClosedAt ?? trade.OpenedAt))
+        foreach (var trade in trades
+            .Where(trade => (trade.ClosedAt ?? trade.OpenedAt).Date == date)
+            .OrderByDescending(trade => trade.ClosedAt ?? trade.OpenedAt))
         {
-            var matches = winning ? trade.ProfitLossAmount > 0 : trade.ProfitLossAmount < 0;
-            if (!matches)
+            if (trade.ProfitLossAmount < 0m)
+            {
+                count++;
+                continue;
+            }
+
+            if (trade.ProfitLossAmount > 0m)
             {
                 break;
             }
-
-            count++;
         }
 
         return count;
@@ -354,4 +475,29 @@ public sealed class BacktestingEngine(
         DateTimeOffset? ClosedAt,
         decimal ProfitLoss,
         string DataSource);
+
+    private sealed class HistoricalBacktestMarketDataProvider(IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>> candles) : IMarketDataProvider
+    {
+        public Task<IReadOnlyList<Candle>> GetCandlesAsync(
+            string symbol,
+            Timeframe timeframe,
+            DateTimeOffset from,
+            DateTimeOffset to,
+            CancellationToken cancellationToken)
+        {
+            if (!candles.TryGetValue(timeframe, out var timeframeCandles))
+            {
+                return Task.FromResult<IReadOnlyList<Candle>>([]);
+            }
+
+            var filtered = timeframeCandles
+                .Where(candle => string.Equals(candle.Symbol, symbol, StringComparison.OrdinalIgnoreCase)
+                    && candle.OpenedAt >= from
+                    && candle.OpenedAt <= to)
+                .OrderBy(candle => candle.OpenedAt)
+                .ToArray();
+
+            return Task.FromResult<IReadOnlyList<Candle>>(filtered);
+        }
+    }
 }

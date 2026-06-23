@@ -9,6 +9,7 @@ dotnet run --project TradingBot.CLI -- start
 dotnet run --project TradingBot.CLI -- stop
 dotnet run --project TradingBot.CLI -- analyze
 dotnet run --project TradingBot.CLI -- backtest --from 2025-05-15 --to 2026-05-15
+dotnet run --project TradingBot.CLI -- find-recent-setups count=10 max_days=30
 dotnet run --project TradingBot.CLI -- download-history --from 2025-05-15 --to 2026-05-15 timeframe=M5
 dotnet run --project TradingBot.CLI -- ctrader-connect
 dotnet run --project TradingBot.CLI -- ctrader-authorize
@@ -25,4 +26,6 @@ dotnet run --project TradingBot.CLI -- analyze-and-createorder confirm_live_orde
 
 Live-environment cTrader order creation requires `AllowLiveOrderCreation=true` in `TradingBot.CLI/appsettings.json` plus the explicit `confirm_live_order=true` command argument.
 
-Historical backtesting data is selected through the provider-neutral `Backtesting.DataSource` setting. Current values are `Sample` and `cTrader`; future providers such as TradingView can be added behind the same `IHistoricalMarketDataProvider` abstraction.
+Historical backtesting data is selected from the first enabled entry in `Backtesting.DataSources`. Current provider values are `cTrader` and `MT5`.
+
+`find-recent-setups` starts with the previous trading day, scans backward by trading day through the first enabled historical provider, and writes up to 2000 valid setups to `reports/recent-setups`. `max_days` defaults to `30`; use `max_days=0` for an unbounded scan.

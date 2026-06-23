@@ -22,86 +22,111 @@ public sealed class SmartMoneyStrategyEngine(
             return Invalid(symbol, TradeDirection.Buy, session, newsReason);
         }
 
-        var daily = await marketData.GetCandlesAsync(symbol, Timeframe.D1, now.AddDays(-60), now, cancellationToken);
-        var hourly = await marketData.GetCandlesAsync(symbol, Timeframe.H1, now.AddDays(-10), now, cancellationToken);
+        var hourly = (await marketData.GetCandlesAsync(symbol, Timeframe.H1, now.AddDays(-10), now, cancellationToken))
+            .OrderBy(candle => candle.OpenedAt)
+            .ToArray();
         var execution = (await marketData.GetCandlesAsync(symbol, Timeframe.M5, now.AddHours(-12), now, cancellationToken))
             .OrderBy(candle => candle.OpenedAt)
             .TakeLast(options.SetupLookbackCandlesM5)
             .ToArray();
 
-        var dailyBias = CalculateBias(daily, options.BiasSwingStrength);
         var h1Bias = CalculateBias(hourly, options.BiasSwingStrength);
-
-        if (dailyBias == MarketBias.Neutral || h1Bias == MarketBias.Neutral || dailyBias != h1Bias)
+        MarketBias directionalBias;
+        if (options.UseDailyBiasFilter)
         {
-            return Invalid(symbol, TradeDirection.Buy, session, "Daily and H1 swing bias are not aligned.");
+            var daily = await marketData.GetCandlesAsync(symbol, Timeframe.D1, now.AddDays(-60), now, cancellationToken);
+            var dailyBias = CalculateBias(daily, options.BiasSwingStrength);
+            if (dailyBias == MarketBias.Neutral || h1Bias == MarketBias.Neutral || dailyBias != h1Bias)
+            {
+                return Invalid(symbol, TradeDirection.Buy, session, "Daily and H1 swing bias are not aligned.");
+            }
+
+            directionalBias = dailyBias;
+        }
+        else
+        {
+            if (h1Bias == MarketBias.Neutral)
+            {
+                return Invalid(symbol, TradeDirection.Buy, session, "H1 swing bias is neutral.");
+            }
+
+            directionalBias = h1Bias;
         }
 
-        var direction = dailyBias == MarketBias.Bullish ? TradeDirection.Buy : TradeDirection.Sell;
-        var sweep = DetectLiquiditySweep(execution, direction, options.LiquiditySweepLookbackCandles);
-        if (sweep is null)
+        var direction = directionalBias == MarketBias.Bullish ? TradeDirection.Buy : TradeDirection.Sell;
+        var sweepCandidates = DetectLiquiditySweeps(execution, direction, options.LiquiditySweepLookbackCandles);
+        if (sweepCandidates.Count == 0)
         {
             return Invalid(symbol, direction, session, "No recent valid liquidity sweep.");
         }
 
-        if (execution.Length - 1 - sweep.Index > options.MaxSetupAgeCandlesM5)
+        var hasRecentSweep = false;
+        foreach (var sweep in sweepCandidates)
         {
-            return Invalid(symbol, direction, session, "Liquidity sweep is older than configured setup age.");
+            if (execution.Length - 1 - sweep.Index > options.MaxSetupAgeCandlesM5)
+            {
+                continue;
+            }
+
+            hasRecentSweep = true;
+            var structureShift = DetectMarketStructureShift(execution, direction, sweep.Index, options.LiquiditySweepLookbackCandles);
+            if (structureShift is null)
+            {
+                continue;
+            }
+
+            var fvg = DetectFairValueGap(execution, direction, Math.Max(2, sweep.Index), structureShift.Index);
+            if (fvg is null)
+            {
+                continue;
+            }
+
+            if (!HasMinimumFvgSize(fvg.Gap))
+            {
+                continue;
+            }
+
+            if (options.RequireDisplacement && !HasDisplacement(execution, structureShift.Index))
+            {
+                continue;
+            }
+
+            var entry = ResolveEntry(fvg.Gap, direction);
+            if (options.UsePremiumDiscountFilter && !IsInPremiumDiscount(execution, direction, entry))
+            {
+                continue;
+            }
+
+            var stopLoss = direction == TradeDirection.Buy
+                ? sweep.SweptPrice - (options.PipSize * options.NormalStopLossBufferPips)
+                : sweep.SweptPrice + (options.PipSize * options.NormalStopLossBufferPips);
+            var risk = Math.Abs(entry - stopLoss);
+            var takeProfit = direction == TradeDirection.Buy
+                ? entry + (risk * options.PreferredRiskReward)
+                : entry - (risk * options.PreferredRiskReward);
+            var rr = risk == 0 ? 0 : Math.Abs(takeProfit - entry) / risk;
+
+            if (rr < options.MinRiskReward)
+            {
+                continue;
+            }
+
+            return new TradeSignal(
+                symbol,
+                direction,
+                entry,
+                stopLoss,
+                takeProfit,
+                decimal.Round(rr, 2),
+                session,
+                true,
+                $"{sweep.LevelName} sweep + MSS/BOS + {direction.ToString().ToLowerInvariant()} FVG",
+                fvg.Gap);
         }
 
-        var structureShift = DetectMarketStructureShift(execution, direction, sweep.Index);
-        if (structureShift is null)
-        {
-            return Invalid(symbol, direction, session, "No MSS/BOS confirmation after liquidity sweep.");
-        }
-
-        var fvg = DetectFairValueGap(execution, direction, Math.Max(2, sweep.Index), structureShift.Index);
-        if (fvg is null)
-        {
-            return Invalid(symbol, direction, session, "No valid fair value gap after sweep/MSS.");
-        }
-
-        if (!HasMinimumFvgSize(fvg.Gap))
-        {
-            return Invalid(symbol, direction, session, "Fair value gap is smaller than configured minimum.");
-        }
-
-        if (options.RequireDisplacement && !HasDisplacement(execution, structureShift.Index))
-        {
-            return Invalid(symbol, direction, session, "Displacement candle is below threshold.");
-        }
-
-        var entry = ResolveEntry(fvg.Gap, direction);
-        if (options.UsePremiumDiscountFilter && !IsInPremiumDiscount(execution, direction, entry))
-        {
-            return Invalid(symbol, direction, session, "Entry is not in the required premium/discount area.");
-        }
-
-        var stopLoss = direction == TradeDirection.Buy
-            ? sweep.SweptPrice - (options.PipSize * options.NormalStopLossBufferPips)
-            : sweep.SweptPrice + (options.PipSize * options.NormalStopLossBufferPips);
-        var risk = Math.Abs(entry - stopLoss);
-        var takeProfit = direction == TradeDirection.Buy
-            ? entry + (risk * options.PreferredRiskReward)
-            : entry - (risk * options.PreferredRiskReward);
-        var rr = risk == 0 ? 0 : Math.Abs(takeProfit - entry) / risk;
-
-        if (rr < options.MinRiskReward)
-        {
-            return Invalid(symbol, direction, session, "Risk reward is below configured minimum.");
-        }
-
-        return new TradeSignal(
-            symbol,
-            direction,
-            entry,
-            stopLoss,
-            takeProfit,
-            decimal.Round(rr, 2),
-            session,
-            true,
-            $"{sweep.LevelName} sweep + MSS/BOS + {direction.ToString().ToLowerInvariant()} FVG",
-            fvg.Gap);
+        return hasRecentSweep
+            ? Invalid(symbol, direction, session, "No complete setup after recent liquidity sweep.")
+            : Invalid(symbol, direction, session, "Liquidity sweep is older than configured setup age.");
     }
 
     public static MarketBias CalculateBias(IReadOnlyList<Candle> candles) =>
@@ -159,13 +184,14 @@ public sealed class SmartMoneyStrategyEngine(
         return lowerCloses ? MarketBias.Bearish : MarketBias.Neutral;
     }
 
-    private static LiquiditySweepDetection? DetectLiquiditySweep(IReadOnlyList<Candle> candles, TradeDirection direction, int lookback)
+    private static IReadOnlyList<LiquiditySweepDetection> DetectLiquiditySweeps(IReadOnlyList<Candle> candles, TradeDirection direction, int lookback)
     {
         if (candles.Count < lookback + 2)
         {
-            return null;
+            return [];
         }
 
+        var sweeps = new List<LiquiditySweepDetection>();
         var start = Math.Max(lookback, candles.Count - lookback);
         for (var i = candles.Count - 1; i >= start; i--)
         {
@@ -181,7 +207,7 @@ public sealed class SmartMoneyStrategyEngine(
                 var priorLow = prior.Min(item => item.Low);
                 if (candle.Low < priorLow && candle.Close > priorLow)
                 {
-                    return new LiquiditySweepDetection(i, new LiquiditySweep(direction, "Sell-side liquidity", candle.Low, candle.OpenedAt));
+                    sweeps.Add(new LiquiditySweepDetection(i, new LiquiditySweep(direction, "Sell-side liquidity", candle.Low, candle.OpenedAt)));
                 }
             }
             else
@@ -189,22 +215,22 @@ public sealed class SmartMoneyStrategyEngine(
                 var priorHigh = prior.Max(item => item.High);
                 if (candle.High > priorHigh && candle.Close < priorHigh)
                 {
-                    return new LiquiditySweepDetection(i, new LiquiditySweep(direction, "Buy-side liquidity", candle.High, candle.OpenedAt));
+                    sweeps.Add(new LiquiditySweepDetection(i, new LiquiditySweep(direction, "Buy-side liquidity", candle.High, candle.OpenedAt)));
                 }
             }
         }
 
-        return null;
+        return sweeps;
     }
 
-    private static StructureShiftDetection? DetectMarketStructureShift(IReadOnlyList<Candle> candles, TradeDirection direction, int sweepIndex)
+    private static StructureShiftDetection? DetectMarketStructureShift(IReadOnlyList<Candle> candles, TradeDirection direction, int sweepIndex, int lookback)
     {
         if (sweepIndex <= 0 || sweepIndex >= candles.Count - 1)
         {
             return null;
         }
 
-        var prior = candles.Take(sweepIndex).ToArray();
+        var prior = candles.Take(sweepIndex).TakeLast(Math.Max(2, lookback)).ToArray();
         if (prior.Length == 0)
         {
             return null;
@@ -286,12 +312,25 @@ public sealed class SmartMoneyStrategyEngine(
 
     private decimal ResolveEntry(FairValueGap fvg, TradeDirection direction)
     {
+        if (string.Equals(options.FvgEntryMode, "FivePercentBoundary", StringComparison.OrdinalIgnoreCase))
+        {
+            return ResolveFivePercentBoundaryEntry(fvg, direction);
+        }
+
         if (string.Equals(options.FvgEntryMode, "Boundary", StringComparison.OrdinalIgnoreCase))
         {
             return direction == TradeDirection.Buy ? fvg.LowerPrice : fvg.UpperPrice;
         }
 
         return fvg.Midpoint;
+    }
+
+    public static decimal ResolveFivePercentBoundaryEntry(FairValueGap fvg, TradeDirection direction)
+    {
+        var offset = fvg.Size * 0.05m;
+        return direction == TradeDirection.Buy
+            ? fvg.UpperPrice - offset
+            : fvg.LowerPrice + offset;
     }
 
     private static bool IsInPremiumDiscount(IReadOnlyList<Candle> candles, TradeDirection direction, decimal entry)

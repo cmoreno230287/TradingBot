@@ -56,59 +56,28 @@ public static class OptionsValidator
             return Result.Failure("Drawdown limits must be configured.");
         }
 
-        if (options.FTMOChallenge.Enabled)
-        {
-            if (options.FTMOChallenge.InitialBalance <= 0)
-            {
-                return Result.Failure("FTMOChallenge:InitialBalance must be greater than zero.");
-            }
-
-            if (options.FTMOChallenge.MinimumTradingDays < 0)
-            {
-                return Result.Failure("FTMOChallenge:MinimumTradingDays cannot be negative.");
-            }
-
-            if (options.FTMOChallenge.MaxDailyLossAmount <= 0 && options.FTMOChallenge.MaxDailyLossPercent <= 0)
-            {
-                return Result.Failure("FTMOChallenge must define MaxDailyLossAmount or MaxDailyLossPercent.");
-            }
-
-            if (options.FTMOChallenge.MaxTotalLossAmount <= 0 && options.FTMOChallenge.MaxTotalLossPercent <= 0)
-            {
-                return Result.Failure("FTMOChallenge must define MaxTotalLossAmount or MaxTotalLossPercent.");
-            }
-
-            if (options.FTMOChallenge.ProfitTargetAmount <= 0 && options.FTMOChallenge.ProfitTargetPercent <= 0)
-            {
-                return Result.Failure("FTMOChallenge must define ProfitTargetAmount or ProfitTargetPercent.");
-            }
-
-            if (options.FTMOChallenge.DailyLossSafetyBufferAmount < 0
-                || options.FTMOChallenge.TotalLossSafetyBufferAmount < 0
-                || options.FTMOChallenge.StopTradingAtProfitTargetBufferAmount < 0
-                || options.FTMOChallenge.DailyLossSafetyBufferPercent < 0
-                || options.FTMOChallenge.TotalLossSafetyBufferPercent < 0
-                || options.FTMOChallenge.StopTradingAtProfitTargetBufferPercent < 0)
-            {
-                return Result.Failure("FTMOChallenge safety buffers cannot be negative.");
-            }
-
-            if (options.FTMOChallenge.MaxDailyLossAmount > 0
-                && options.FTMOChallenge.DailyLossSafetyBufferAmount >= options.FTMOChallenge.MaxDailyLossAmount)
-            {
-                return Result.Failure("FTMOChallenge:DailyLossSafetyBufferAmount must be lower than MaxDailyLossAmount.");
-            }
-
-            if (options.FTMOChallenge.MaxTotalLossAmount > 0
-                && options.FTMOChallenge.TotalLossSafetyBufferAmount >= options.FTMOChallenge.MaxTotalLossAmount)
-            {
-                return Result.Failure("FTMOChallenge:TotalLossSafetyBufferAmount must be lower than MaxTotalLossAmount.");
-            }
-        }
-
         if (options.AnalysisExecutionIntervalSeconds <= 0)
         {
             return Result.Failure("AnalysisExecutionIntervalSeconds must be greater than zero.");
+        }
+
+        var enabledStrategies = options.Strategies.Items.Where(item => item.Enabled).ToArray();
+        if (enabledStrategies.Length == 0)
+        {
+            return Result.Failure("At least one strategy must be enabled.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.Strategies.ActiveStrategyId)
+            && !enabledStrategies.Any(item => string.Equals(item.Id, options.Strategies.ActiveStrategyId, StringComparison.OrdinalIgnoreCase)))
+        {
+            return Result.Failure("Strategies:ActiveStrategyId must reference an enabled strategy.");
+        }
+
+        if (!string.Equals(options.ActiveStrategy.Engine, "SmartMoney", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(options.ActiveStrategy.Engine, "HourlySweepM1Fvg", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(options.ActiveStrategy.Engine, "SmcLiquiditySweepChoch", StringComparison.OrdinalIgnoreCase))
+        {
+            return Result.Failure("Supported strategy engines are SmartMoney, HourlySweepM1Fvg, and SmcLiquiditySweepChoch.");
         }
 
         if (options.BiasSwingStrength <= 0 || options.SetupLookbackCandlesM5 <= 0 || options.LiquiditySweepLookbackCandles <= 0 || options.MaxSetupAgeCandlesM5 <= 0)
@@ -126,14 +95,10 @@ public static class OptionsValidator
             return Result.Failure("TradeTracking:MaxRowsPerFile and TradeTracking:LookbackDays must be greater than zero.");
         }
 
-        if (options.SignalTracking.MaxRowsPerFile <= 0)
+        if (options.DailyTradingStop.Enabled
+            && (options.DailyTradingStop.MaxWinningTradesPerDay <= 0 || options.DailyTradingStop.MaxLosingTradesPerDay <= 0))
         {
-            return Result.Failure("SignalTracking:MaxRowsPerFile must be greater than zero.");
-        }
-
-        if (options.TradingView.ScreenshotWidth <= 0 || options.TradingView.ScreenshotHeight <= 0)
-        {
-            return Result.Failure("TradingView screenshot dimensions must be greater than zero.");
+            return Result.Failure("DailyTradingStop winning and losing trade limits must be greater than zero.");
         }
 
         if (options.MaxActiveTrades <= 0)
@@ -147,10 +112,36 @@ public static class OptionsValidator
             return Result.Failure("Broker must be 'cTrader' or 'MT5'.");
         }
 
-        if (!string.Equals(options.Backtesting.DataSource, "cTrader", StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(options.Backtesting.DataSource, "MT5", StringComparison.OrdinalIgnoreCase))
+        var enabledBacktestingSources = options.Backtesting.DataSources
+            .Where(item => item.Enabled)
+            .ToArray();
+        if (enabledBacktestingSources.Length == 0)
+        {
+            return Result.Failure("At least one backtesting data source must be enabled.");
+        }
+
+        if (!string.Equals(options.ActiveBacktestingDataSource.DataSource, "cTrader", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(options.ActiveBacktestingDataSource.DataSource, "MT5", StringComparison.OrdinalIgnoreCase))
         {
             return Result.Failure("Backtesting:DataSource must be 'cTrader' or 'MT5'. Sample market data is not supported.");
+        }
+
+        if (options.ActiveBacktestingDataSource.HistoricalDataChunkDaysM1 <= 0
+            || options.ActiveBacktestingDataSource.HistoricalDataChunkDaysM5 <= 0
+            || options.ActiveBacktestingDataSource.HistoricalDataChunkDaysH1 <= 0
+            || options.ActiveBacktestingDataSource.HistoricalDataChunkDaysD1 <= 0)
+        {
+            return Result.Failure("Active backtesting data source historical chunk days must be greater than zero.");
+        }
+
+        var activeChallenge = options.ActiveFundedAccountChallenge;
+        if (activeChallenge is not null)
+        {
+            var validation = ValidateFundedChallenge(activeChallenge);
+            if (!validation.IsSuccess)
+            {
+                return validation;
+            }
         }
 
         if (string.Equals(options.Broker, "MT5", StringComparison.OrdinalIgnoreCase))
@@ -175,15 +166,55 @@ public static class OptionsValidator
                 return Result.Failure("MT5:MaxActiveTrades must be greater than zero.");
             }
 
-            if (options.MT5.PendingOrderExpirationMinutes <= 0)
+            if (options.MT5.PendingOrderExpirationHours <= 0)
             {
-                return Result.Failure("MT5:PendingOrderExpirationMinutes must be greater than zero.");
+                return Result.Failure("MT5:PendingOrderExpirationHours must be greater than zero.");
             }
 
             if (options.MT5.MaxSlippagePoints < 0)
             {
                 return Result.Failure("MT5:MaxSlippagePoints cannot be negative.");
             }
+        }
+
+        return Result.Success();
+    }
+
+    private static Result ValidateFundedChallenge(FundedAccountChallengeOptions challenge)
+    {
+        if (challenge.InitialBalance <= 0)
+        {
+            return Result.Failure("Funded account challenge InitialBalance must be greater than zero.");
+        }
+
+        if (challenge.MinimumTradingDays < 0)
+        {
+            return Result.Failure("Funded account challenge MinimumTradingDays cannot be negative.");
+        }
+
+        if (challenge.MaxDailyLossAmount <= 0 && challenge.MaxDailyLossPercent <= 0)
+        {
+            return Result.Failure("Funded account challenge must define MaxDailyLossAmount or MaxDailyLossPercent.");
+        }
+
+        if (challenge.MaxTotalLossAmount <= 0 && challenge.MaxTotalLossPercent <= 0)
+        {
+            return Result.Failure("Funded account challenge must define MaxTotalLossAmount or MaxTotalLossPercent.");
+        }
+
+        if (challenge.ProfitTargetAmount <= 0 && challenge.ProfitTargetPercent <= 0)
+        {
+            return Result.Failure("Funded account challenge must define ProfitTargetAmount or ProfitTargetPercent.");
+        }
+
+        if (challenge.DailyLossSafetyBufferAmount < 0
+            || challenge.TotalLossSafetyBufferAmount < 0
+            || challenge.StopTradingAtProfitTargetBufferAmount < 0
+            || challenge.DailyLossSafetyBufferPercent < 0
+            || challenge.TotalLossSafetyBufferPercent < 0
+            || challenge.StopTradingAtProfitTargetBufferPercent < 0)
+        {
+            return Result.Failure("Funded account challenge safety buffers cannot be negative.");
         }
 
         return Result.Success();

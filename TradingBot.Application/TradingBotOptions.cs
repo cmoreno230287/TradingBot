@@ -1,15 +1,21 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace TradingBot.Application;
 
 public sealed class TradingBotOptions
 {
+    public const string DefaultStrategyId = "EURUSD_Scalping_Forex_V1";
+
+    [JsonIgnore]
     public string Symbol { get; set; } = "EURUSD";
     public string Broker { get; set; } = "cTrader";
     public bool LiveTradingEnabled { get; set; }
     public int AnalysisExecutionIntervalSeconds { get; set; } = 60;
+    public StrategySelectionOptions Strategies { get; set; } = StrategySelectionOptions.CreateDefault();
     public BacktestingOptions Backtesting { get; set; } = new();
+    [JsonIgnore]
     public FTMOChallengeOptions FTMOChallenge { get; set; } = new();
+    public FundedAccountChallengesOptions FundedAccountChallenges { get; set; } = new();
     public LowRiskRolloutOptions LowRiskRollout { get; set; } = new();
     public BrokerOptions Brokers { get; set; } = new();
     [JsonIgnore]
@@ -26,14 +32,18 @@ public sealed class TradingBotOptions
         set => Brokers.MT5 = value;
     }
 
-    public TradingViewOptions TradingView { get; set; } = new();
+    [JsonIgnore]
     public string MacroBiasTimeframe { get; set; } = "D1";
+    [JsonIgnore]
     public string BiasTimeframe { get; set; } = "H1";
+    [JsonIgnore]
     public string ExecutionTimeframe { get; set; } = "M5";
+    [JsonIgnore]
     public string EntryTimeframe { get; set; } = "M1";
     public bool UsePreviousDayHighLow { get; set; } = true;
     public bool UsePreviousWeekHighLow { get; set; } = true;
     public bool UseSessionHighLow { get; set; } = true;
+    [JsonIgnore]
     public bool UsePremiumDiscountFilter { get; set; } = true;
     public bool UseLiquidityTargetFilter { get; set; } = true;
     public decimal AccountBalance { get; set; } = 10_000m;
@@ -44,7 +54,9 @@ public sealed class TradingBotOptions
     public decimal WeeklyDrawdownLimitPercent { get; set; } = 5.0m;
     public int MaxConsecutiveLosses { get; set; } = 2;
     public int MaxConsecutiveLosingDays { get; set; } = 3;
+    [JsonIgnore]
     public decimal MinRiskReward { get; set; } = 2.0m;
+    [JsonIgnore]
     public decimal PreferredRiskReward { get; set; } = 3.0m;
     public decimal MaxSpreadPips { get; set; } = 1.5m;
     public decimal PipValuePerLot { get; set; } = 10m;
@@ -52,14 +64,25 @@ public sealed class TradingBotOptions
     public int SwingStrength { get; set; } = 2;
     public bool RequireCandleCloseForBos { get; set; } = true;
     public bool RequireMarketStructureShift { get; set; } = true;
+    [JsonIgnore]
     public bool RequireDisplacement { get; set; } = true;
+    [JsonIgnore]
     public decimal DisplacementMinBodyToRangeRatio { get; set; } = 0.60m;
+    [JsonIgnore]
     public decimal DisplacementAtrMultiplier { get; set; } = 1.20m;
+    [JsonIgnore]
+    public bool UseDailyBiasFilter { get; set; } = true;
+    [JsonIgnore]
     public int BiasSwingStrength { get; set; } = 2;
+    [JsonIgnore]
     public int SetupLookbackCandlesM5 { get; set; } = 96;
+    [JsonIgnore]
     public int LiquiditySweepLookbackCandles { get; set; } = 24;
+    [JsonIgnore]
     public int MaxSetupAgeCandlesM5 { get; set; } = 12;
+    [JsonIgnore]
     public decimal MinFvgSizePips { get; set; } = 1.0m;
+    [JsonIgnore]
     public string FvgEntryMode { get; set; } = "Dynamic";
     public string DefaultFvgEntryMode { get; set; } = "Midpoint";
     public bool AllowBoundaryEntryOnStrongDisplacement { get; set; } = true;
@@ -77,10 +100,15 @@ public sealed class TradingBotOptions
     public bool UseAtrBasedBuffer { get; set; } = true;
     public int AtrPeriod { get; set; } = 14;
     public decimal AtrBufferMultiplier { get; set; } = 0.10m;
+    [JsonIgnore]
     public bool TradeOutKillZoneTime { get; set; }
+    [JsonIgnore]
     public string[] AllowedSessions { get; set; } = ["London", "NewYork", "LondonNewYorkOverlap"];
+    [JsonIgnore]
     public string LondonKillZoneNYTime { get; set; } = "02:00-05:00";
+    [JsonIgnore]
     public string NewYorkKillZoneNYTime { get; set; } = "08:30-11:00";
+    [JsonIgnore]
     public string LondonNewYorkOverlapNYTime { get; set; } = "08:00-11:00";
     public int PendingOrderExpirationCandlesM5 { get; set; } = 6;
     public int PendingOrderExpirationCandlesM1 { get; set; } = 10;
@@ -89,7 +117,118 @@ public sealed class TradingBotOptions
     public string ReportsDirectory { get; set; } = "reports";
     public OperationalMonitoringOptions OperationalMonitoring { get; set; } = new();
     public TradeTrackingOptions TradeTracking { get; set; } = new();
-    public SignalTrackingOptions SignalTracking { get; set; } = new();
+    public DailyTradingStopOptions DailyTradingStop { get; set; } = new();
+    public TradingSessionOptions TradingSessions { get; set; } = new();
+
+    [JsonIgnore]
+    public StrategyDefinitionOptions ActiveStrategy { get; private set; } = StrategyDefinitionOptions.CreateDefault();
+
+    [JsonIgnore]
+    public BacktestingDataSourceOptions ActiveBacktestingDataSource { get; private set; } = BacktestingDataSourceOptions.CreateLegacyDefault();
+
+    [JsonIgnore]
+    public FundedAccountChallengeOptions? ActiveFundedAccountChallenge { get; private set; }
+
+    public void Normalize()
+    {
+        ActiveStrategy = Strategies.ResolveActive();
+        ApplyStrategy(ActiveStrategy);
+
+        ApplyTradingSessions();
+
+        ActiveBacktestingDataSource = Backtesting.ResolveActive();
+        Backtesting.ApplyActive(ActiveBacktestingDataSource);
+
+        ActiveFundedAccountChallenge = FundedAccountChallenges.ResolveActive();
+        if (ActiveFundedAccountChallenge is not null)
+        {
+            FTMOChallenge = ActiveFundedAccountChallenge.ToFtmoOptions();
+        }
+    }
+
+    private void ApplyStrategy(StrategyDefinitionOptions strategy)
+    {
+        Symbol = string.IsNullOrWhiteSpace(strategy.Symbol) ? Symbol : strategy.Symbol;
+        MacroBiasTimeframe = strategy.MacroBiasTimeframe;
+        BiasTimeframe = strategy.BiasTimeframe;
+        ExecutionTimeframe = strategy.ExecutionTimeframe;
+        EntryTimeframe = strategy.EntryTimeframe;
+        UseDailyBiasFilter = strategy.UseDailyBiasFilter;
+        UsePremiumDiscountFilter = strategy.UsePremiumDiscountFilter;
+        MinRiskReward = strategy.MinRiskReward;
+        PreferredRiskReward = strategy.PreferredRiskReward;
+        BiasSwingStrength = strategy.BiasSwingStrength;
+        SetupLookbackCandlesM5 = strategy.SetupLookbackCandlesM5;
+        LiquiditySweepLookbackCandles = strategy.LiquiditySweepLookbackCandles;
+        MaxSetupAgeCandlesM5 = strategy.MaxSetupAgeCandlesM5;
+        MinFvgSizePips = strategy.MinFvgSizePips;
+        FvgEntryMode = strategy.FvgEntryMode;
+        RequireDisplacement = strategy.RequireDisplacement;
+        DisplacementMinBodyToRangeRatio = strategy.DisplacementMinBodyToRangeRatio;
+        DisplacementAtrMultiplier = strategy.DisplacementAtrMultiplier;
+    }
+
+    private void ApplyTradingSessions()
+    {
+        AllowedSessions = TradingSessions.AllowedSessions;
+        LondonKillZoneNYTime = TradingSessions.LondonKillZoneNYTime;
+        NewYorkKillZoneNYTime = TradingSessions.NewYorkKillZoneNYTime;
+        LondonNewYorkOverlapNYTime = TradingSessions.LondonNewYorkOverlapNYTime;
+        TradeOutKillZoneTime = TradingSessions.TradeOutKillZoneTime;
+    }
+}
+
+public sealed class StrategySelectionOptions
+{
+    public string ActiveStrategyId { get; set; } = TradingBotOptions.DefaultStrategyId;
+    public List<StrategyDefinitionOptions> Items { get; set; } = [StrategyDefinitionOptions.CreateDefault()];
+
+    public static StrategySelectionOptions CreateDefault() => new();
+
+    public StrategyDefinitionOptions ResolveActive()
+    {
+        if (Items.Count == 0)
+        {
+            Items.Add(StrategyDefinitionOptions.CreateDefault());
+        }
+
+        var enabled = Items.Where(item => item.Enabled).ToArray();
+        if (enabled.Length == 0)
+        {
+            return Items[0];
+        }
+
+        var selected = enabled.FirstOrDefault(item => string.Equals(item.Id, ActiveStrategyId, StringComparison.OrdinalIgnoreCase));
+        return selected ?? enabled[0];
+    }
+}
+
+public sealed class StrategyDefinitionOptions
+{
+    public string Id { get; set; } = TradingBotOptions.DefaultStrategyId;
+    public bool Enabled { get; set; } = true;
+    public string Name { get; set; } = "EURUSD SMC Scalping Forex V1";
+    public string Engine { get; set; } = "SmartMoney";
+    public string Symbol { get; set; } = "EURUSD";
+    public string MacroBiasTimeframe { get; set; } = "D1";
+    public string BiasTimeframe { get; set; } = "H1";
+    public string ExecutionTimeframe { get; set; } = "M5";
+    public string EntryTimeframe { get; set; } = "M1";
+    public bool UseDailyBiasFilter { get; set; }
+    public bool UsePremiumDiscountFilter { get; set; } = true;
+    public decimal MinRiskReward { get; set; } = 2.0m;
+    public decimal PreferredRiskReward { get; set; } = 3.0m;
+    public int BiasSwingStrength { get; set; } = 2;
+    public int SetupLookbackCandlesM5 { get; set; } = 96;
+    public int LiquiditySweepLookbackCandles { get; set; } = 24;
+    public int MaxSetupAgeCandlesM5 { get; set; } = 12;
+    public decimal MinFvgSizePips { get; set; } = 1.0m;
+    public string FvgEntryMode { get; set; } = "Dynamic";
+    public bool RequireDisplacement { get; set; } = true;
+    public decimal DisplacementMinBodyToRangeRatio { get; set; } = 0.60m;
+    public decimal DisplacementAtrMultiplier { get; set; } = 1.20m;
+
+    public static StrategyDefinitionOptions CreateDefault() => new();
 }
 
 public sealed class OperationalMonitoringOptions
@@ -106,11 +245,11 @@ public sealed class TradeTrackingOptions
     public int LookbackDays { get; set; } = 30;
 }
 
-public sealed class SignalTrackingOptions
+public sealed class DailyTradingStopOptions
 {
     public bool Enabled { get; set; } = true;
-    public string Directory { get; set; } = "reports/signals";
-    public int MaxRowsPerFile { get; set; } = 2000;
+    public int MaxWinningTradesPerDay { get; set; } = 1;
+    public int MaxLosingTradesPerDay { get; set; } = 2;
 }
 
 public sealed class BrokerOptions
@@ -144,6 +283,81 @@ public sealed class CTraderOptions
 
 public sealed class BacktestingOptions
 {
+    [JsonIgnore]
+    public string DataSource { get; set; } = "cTrader";
+    [JsonIgnore]
+    public bool CacheEnabled { get; set; } = true;
+    [JsonIgnore]
+    public string CacheDirectory { get; set; } = "data/historical";
+    [JsonIgnore]
+    public int HistoricalDataChunkDaysM1 { get; set; } = 7;
+    [JsonIgnore]
+    public int HistoricalDataChunkDaysM5 { get; set; } = 30;
+    [JsonIgnore]
+    public int HistoricalDataChunkDaysH1 { get; set; } = 180;
+    [JsonIgnore]
+    public int HistoricalDataChunkDaysD1 { get; set; } = 365;
+    public List<BacktestingDataSourceOptions> DataSources { get; set; } =
+    [
+        new() { Name = "cTrader", Enabled = true, DataSource = "cTrader" },
+        new() { Name = "MT5", Enabled = false, DataSource = "MT5" }
+    ];
+    [JsonIgnore]
+    public BacktestingDataSourceOptions CTrader { get; set; } = new() { Name = "cTrader", Enabled = false, DataSource = "cTrader" };
+    [JsonIgnore]
+    public BacktestingDataSourceOptions MT5 { get; set; } = new() { Name = "MT5", Enabled = false, DataSource = "MT5" };
+
+    public BacktestingDataSourceOptions ResolveActive()
+    {
+        var candidates = DataSources
+            .Concat([CTrader, MT5])
+            .Where(item => item.Enabled)
+            .ToArray();
+
+        if (candidates.Length > 0)
+        {
+            return candidates[0];
+        }
+
+        return new BacktestingDataSourceOptions
+        {
+            Name = DataSource,
+            Enabled = true,
+            DataSource = DataSource,
+            CacheEnabled = CacheEnabled,
+            CacheDirectory = CacheDirectory,
+            HistoricalDataChunkDaysM1 = HistoricalDataChunkDaysM1,
+            HistoricalDataChunkDaysM5 = HistoricalDataChunkDaysM5,
+            HistoricalDataChunkDaysH1 = HistoricalDataChunkDaysH1,
+            HistoricalDataChunkDaysD1 = HistoricalDataChunkDaysD1
+        };
+    }
+
+    public void ApplyActive(BacktestingDataSourceOptions active)
+    {
+        DataSource = string.IsNullOrWhiteSpace(active.DataSource) ? active.Name : active.DataSource;
+        CacheEnabled = active.CacheEnabled;
+        CacheDirectory = active.CacheDirectory;
+        HistoricalDataChunkDaysM1 = active.HistoricalDataChunkDaysM1;
+        HistoricalDataChunkDaysM5 = active.HistoricalDataChunkDaysM5;
+        HistoricalDataChunkDaysH1 = active.HistoricalDataChunkDaysH1;
+        HistoricalDataChunkDaysD1 = active.HistoricalDataChunkDaysD1;
+    }
+}
+
+public sealed class TradingSessionOptions
+{
+    public string[] AllowedSessions { get; set; } = ["London", "NewYork", "LondonNewYorkOverlap"];
+    public string LondonKillZoneNYTime { get; set; } = "02:00-05:00";
+    public string NewYorkKillZoneNYTime { get; set; } = "08:30-11:00";
+    public string LondonNewYorkOverlapNYTime { get; set; } = "08:00-11:00";
+    public bool TradeOutKillZoneTime { get; set; }
+}
+
+public sealed class BacktestingDataSourceOptions
+{
+    public string Name { get; set; } = "cTrader";
+    public bool Enabled { get; set; }
     public string DataSource { get; set; } = "cTrader";
     public bool CacheEnabled { get; set; } = true;
     public string CacheDirectory { get; set; } = "data/historical";
@@ -151,6 +365,8 @@ public sealed class BacktestingOptions
     public int HistoricalDataChunkDaysM5 { get; set; } = 30;
     public int HistoricalDataChunkDaysH1 { get; set; } = 180;
     public int HistoricalDataChunkDaysD1 { get; set; } = 365;
+
+    public static BacktestingDataSourceOptions CreateLegacyDefault() => new() { Enabled = true };
 }
 
 public sealed class FTMOChallengeOptions
@@ -172,6 +388,66 @@ public sealed class FTMOChallengeOptions
     public decimal StopTradingAtProfitTargetBufferPercent { get; set; } = 0m;
 }
 
+public sealed class FundedAccountChallengesOptions
+{
+    public List<FundedAccountChallengeOptions> Items { get; set; } = [FundedAccountChallengeOptions.CreateFtmoDefault()];
+    [JsonIgnore]
+    public FundedAccountChallengeOptions FTMO { get; set; } = FundedAccountChallengeOptions.CreateDisabledFtmoDefault();
+
+    public FundedAccountChallengeOptions? ResolveActive()
+    {
+        var candidates = Items
+            .Concat([FTMO])
+            .Where(item => item.Enabled)
+            .ToArray();
+
+        return candidates.FirstOrDefault();
+    }
+}
+
+public sealed class FundedAccountChallengeOptions
+{
+    public string Name { get; set; } = "FTMO";
+    public bool Enabled { get; set; } = true;
+    public decimal InitialBalance { get; set; } = 100000m;
+    public int MinimumTradingDays { get; set; } = 2;
+    public decimal ProfitTargetAmount { get; set; } = 5000m;
+    public decimal MaxDailyLossAmount { get; set; } = 5000m;
+    public decimal MaxTotalLossAmount { get; set; } = 10000m;
+    public decimal ProfitTargetPercent { get; set; } = 10m;
+    public decimal MaxDailyLossPercent { get; set; } = 5m;
+    public decimal MaxTotalLossPercent { get; set; } = 10m;
+    public decimal DailyLossSafetyBufferAmount { get; set; } = 500m;
+    public decimal TotalLossSafetyBufferAmount { get; set; } = 500m;
+    public decimal StopTradingAtProfitTargetBufferAmount { get; set; } = 100m;
+    public decimal DailyLossSafetyBufferPercent { get; set; } = 0m;
+    public decimal TotalLossSafetyBufferPercent { get; set; } = 0m;
+    public decimal StopTradingAtProfitTargetBufferPercent { get; set; } = 0m;
+
+    public static FundedAccountChallengeOptions CreateFtmoDefault() => new();
+
+    public static FundedAccountChallengeOptions CreateDisabledFtmoDefault() => new() { Enabled = false };
+
+    public FTMOChallengeOptions ToFtmoOptions() => new()
+    {
+        Enabled = Enabled,
+        InitialBalance = InitialBalance,
+        MinimumTradingDays = MinimumTradingDays,
+        ProfitTargetAmount = ProfitTargetAmount,
+        MaxDailyLossAmount = MaxDailyLossAmount,
+        MaxTotalLossAmount = MaxTotalLossAmount,
+        ProfitTargetPercent = ProfitTargetPercent,
+        MaxDailyLossPercent = MaxDailyLossPercent,
+        MaxTotalLossPercent = MaxTotalLossPercent,
+        DailyLossSafetyBufferAmount = DailyLossSafetyBufferAmount,
+        TotalLossSafetyBufferAmount = TotalLossSafetyBufferAmount,
+        StopTradingAtProfitTargetBufferAmount = StopTradingAtProfitTargetBufferAmount,
+        DailyLossSafetyBufferPercent = DailyLossSafetyBufferPercent,
+        TotalLossSafetyBufferPercent = TotalLossSafetyBufferPercent,
+        StopTradingAtProfitTargetBufferPercent = StopTradingAtProfitTargetBufferPercent
+    };
+}
+
 public sealed class LowRiskRolloutOptions
 {
     public bool Enabled { get; set; } = true;
@@ -190,19 +466,10 @@ public sealed class MT5Options
     public int TimeoutSeconds { get; set; } = 10;
     public bool AllowLiveOrderCreation { get; set; }
     public int UnitsPerLot { get; set; } = 100000;
-    public int PendingOrderExpirationMinutes { get; set; } = 30;
+    public int PendingOrderExpirationHours { get; set; } = 12;
     public int MaxSlippagePoints { get; set; } = 20;
     public bool CancelStalePendingOrders { get; set; } = true;
 }
 
-public sealed class TradingViewOptions
-{
-    public string Symbol { get; set; } = "FX:EURUSD";
-    public string Exchange { get; set; } = "FX";
-    public string Interval { get; set; } = "5";
-    public string ScreenshotDirectory { get; set; } = "MarketScreenshots";
-    public string ScreenshotExtension { get; set; } = "png";
-    public string BrowserPath { get; set; } = "";
-    public int ScreenshotWidth { get; set; } = 1440;
-    public int ScreenshotHeight { get; set; } = 900;
-}
+
+

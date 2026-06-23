@@ -29,6 +29,17 @@ TIMEFRAMES = {
     "D1": lambda: mt5.TIMEFRAME_D1,
 }
 
+TRADE_RETCODE_HINTS = {
+    10018: "MT5 market is closed for this symbol.",
+    10019: "MT5 rejected the order because there is not enough margin.",
+    10020: "MT5 price changed before the order could be accepted.",
+    10021: "MT5 has no quote available for this symbol.",
+    10022: "MT5 rejected the pending order expiration mode or expiration time.",
+    10024: "MT5 rejected the request because there are too many trade requests.",
+    10027: "MT5 Algo Trading/AutoTrading is disabled in the client terminal. Enable the Algo Trading button and allow algorithmic trading in Tools > Options > Expert Advisors.",
+    10030: "MT5 rejected the order filling mode for this symbol.",
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -164,7 +175,7 @@ def account_risk_state() -> dict[str, Any]:
         "equity": account.get("equity", 0),
         "dailyRealizedProfitLoss": daily_realized,
         "weeklyRealizedProfitLoss": weekly_realized,
-        "consecutiveLosses": consecutive_losses(all_recent_deals),
+        "consecutiveLosses": consecutive_losses(daily_deals),
         "consecutiveLosingDays": consecutive_losing_days(all_recent_deals),
         "tradingDays": trading_days,
         "dailyStartingBalance": float(account.get("balance", 0)) - daily_realized,
@@ -225,11 +236,29 @@ def order_comment(client_order_id: str) -> str:
     return f"TBOT{suffix}"[:16]
 
 
+def trade_rejection_reason(response: dict[str, Any]) -> str:
+    retcode = int(response.get("retcode", 0) or 0)
+    comment = str(response.get("comment") or "").strip()
+    hint = TRADE_RETCODE_HINTS.get(retcode)
+    parts = [f"MT5 retcode {retcode}"]
+    if comment:
+        parts.append(comment)
+    if hint:
+        parts.append(hint)
+    return ". ".join(parts)
+
+
 class MT5BridgeHandler(BaseHTTPRequestHandler):
     server_version = "TradingBotMT5Bridge/1.0"
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(f"{utc_now()} {self.address_string()} {format % args}")
+        return
+
+    def log_error(self, format: str, *args: Any) -> None:
+        print(f"{utc_now()} ERROR {self.address_string()} {format % args}")
+
+    def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+        return
 
     def do_GET(self) -> None:
         self._handle(lambda: self.route_get())
@@ -245,6 +274,7 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
             status, payload = action()
             self.send_json(status, payload)
         except Exception as exc:
+            print(f"{utc_now()} ERROR {self.command} {self.path} failed: {exc}")
             self.send_json(500, {"error": str(exc)})
 
     def send_json(self, status: int, payload: Any) -> None:
@@ -255,8 +285,10 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            if status >= 400:
+                print(f"{utc_now()} ERROR {self.command} {self.path} -> {status}: {json.dumps(payload, separators=(',', ':'), default=str)}")
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            print(f"{utc_now()} client disconnected before response could be written")
+            print(f"{utc_now()} ERROR client disconnected before response could be written for {self.command} {self.path}")
 
     def route_get(self) -> tuple[int, Any]:
         parsed = urlparse(self.path)
@@ -575,7 +607,13 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
             response = to_jsonable(result)
 
         if int(response.get("retcode", 0)) not in accepted_retcodes:
-            return 400, {"error": "MT5 rejected order creation.", "request": request, "result": response}
+            return 400, {
+                "error": "MT5 rejected order creation.",
+                "reason": trade_rejection_reason(response),
+                "retcode": int(response.get("retcode", 0) or 0),
+                "request": request,
+                "result": response,
+            }
 
         return 200, {
             "clientOrderId": client_order_id,

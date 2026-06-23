@@ -78,7 +78,8 @@ public sealed class MT5BridgeClient
             return Result<StaleOrderCleanupResult>.Success(new StaleOrderCleanupResult(0, 0, []));
         }
 
-        var path = $"orders?symbol={Uri.EscapeDataString(_options.Symbol)}&magicNumber={_options.MT5.MagicNumber}&olderThanMinutes={_options.MT5.PendingOrderExpirationMinutes}";
+        var expirationMinutes = _options.MT5.PendingOrderExpirationHours * 60;
+        var path = $"orders?symbol={Uri.EscapeDataString(_options.Symbol)}&magicNumber={_options.MT5.MagicNumber}&olderThanMinutes={expirationMinutes}";
         var ordersResult = await GetJsonAsync(path, "MT5 stale pending orders", cancellationToken);
         if (!ordersResult.IsSuccess)
         {
@@ -229,7 +230,7 @@ public sealed class MT5BridgeClient
             takeProfit = signal.TakeProfit,
             riskReward = signal.RiskReward,
             magicNumber = _options.MT5.MagicNumber,
-            expirationMinutes = _options.MT5.PendingOrderExpirationMinutes,
+            expirationMinutes = _options.MT5.PendingOrderExpirationHours * 60,
             maxSlippagePoints = _options.MT5.MaxSlippagePoints
         };
 

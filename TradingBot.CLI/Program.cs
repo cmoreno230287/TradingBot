@@ -1,6 +1,5 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Diagnostics;
 using TradingBot.Application;
 using TradingBot.Backtesting;
 using TradingBot.Domain;
@@ -44,9 +43,9 @@ return command switch
     "stop" => Stop(),
     "analyze" => await AnalyzeAsync(services, cancellationToken),
     "backtest" => await BacktestAsync(services, args, cancellationToken),
+    "find-recent-setups" => await FindRecentSetupsAsync(services, args, cancellationToken),
     "backtest-learning" => await BacktestLearningAsync(services, args, cancellationToken),
     "download-history" => await DownloadHistoryAsync(services, args, cancellationToken),
-    "find-signal" => await FindSignalAsync(services, args, cancellationToken),
     "ctrader-connect" => await CTraderConnectAsync(services, cancellationToken),
     "ctrader-authorize" => await CTraderAuthorizeAsync(services, cancellationToken),
     "ctrader-request-token" => await CTraderRequestTokenAsync(services, cancellationToken),
@@ -82,10 +81,10 @@ static ServiceRegistry BuildServices(string appsettingsPath, TradingBotOptions o
         : new CTraderMarketDataProvider(cTraderJsonApi, options);
     var newsFilter = new NewsFilter(options);
     var sessionClock = new NewYorkSessionClock();
-    var strategy = new SmartMoneyStrategyEngine(marketData, newsFilter, sessionClock, options);
+    var strategy = BuildStrategyEngine(options, marketData, newsFilter, sessionClock);
     var risk = new RiskManager(options);
     var historicalProvider = BuildHistoricalProvider(options, cTraderJsonApi, mt5Bridge);
-    IHistoricalTickDataProvider? tickProvider = string.Equals(options.Backtesting.DataSource, "MT5", StringComparison.OrdinalIgnoreCase)
+    IHistoricalTickDataProvider? tickProvider = string.Equals(options.ActiveBacktestingDataSource.DataSource, "MT5", StringComparison.OrdinalIgnoreCase)
         ? new MT5HistoricalTickDataProvider(mt5Bridge)
         : null;
 
@@ -99,11 +98,31 @@ static ServiceRegistry BuildServices(string appsettingsPath, TradingBotOptions o
         historicalProvider,
         strategy,
         risk,
-        new BacktestingEngine(strategy, risk, historicalProvider, tickProvider, options),
+        new BacktestingEngine(
+            marketDataProvider => BuildStrategyEngine(options, marketDataProvider, newsFilter, sessionClock),
+            risk,
+            historicalProvider,
+            tickProvider,
+            options),
         new CsvJournalWriter(options),
+        new RecentValidSetupCsvWriter(options),
         new OperationalLogWriter(options),
-        new ClosedTradeTrackingWriter(options),
-        new SignalTrackingWriter(options));
+        new ClosedTradeTrackingWriter(options));
+}
+
+static IStrategyEngine BuildStrategyEngine(
+    TradingBotOptions options,
+    IMarketDataProvider marketData,
+    INewsFilter newsFilter,
+    ISessionClock sessionClock)
+{
+    return options.ActiveStrategy.Engine.ToLowerInvariant() switch
+    {
+        "smartmoney" => new SmartMoneyStrategyEngine(marketData, newsFilter, sessionClock, options),
+        "hourlysweepm1fvg" => new HourlySweepM1FvgStrategyEngine(marketData, newsFilter, sessionClock, options),
+        "smcliquiditysweepchoch" => new SmcLiquiditySweepChochStrategyEngine(marketData, newsFilter, sessionClock, options),
+        _ => throw new InvalidOperationException($"Unsupported strategy engine '{options.ActiveStrategy.Engine}'.")
+    };
 }
 
 static IHistoricalMarketDataProvider BuildHistoricalProvider(
@@ -117,7 +136,7 @@ static IHistoricalMarketDataProvider BuildHistoricalProvider(
         new CachedHistoricalMarketDataProvider(new MT5HistoricalMarketDataProvider(mt5Bridge, options), options)
     };
 
-    return new HistoricalMarketDataProviderFactory(providers).Resolve(options.Backtesting.DataSource);
+    return new HistoricalMarketDataProviderFactory(providers).Resolve(options.ActiveBacktestingDataSource.DataSource);
 }
 
 static async Task<int> StartAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
@@ -275,30 +294,11 @@ static async Task<int> BacktestAsync(ServiceRegistry services, string[] args, Ca
         return 2;
     }
 
-    if (string.Equals(services.Options.Backtesting.DataSource, "cTrader", StringComparison.OrdinalIgnoreCase))
+    var sourceValidation = await ValidateHistoricalMarketDataSourceAsync(services, "Backtest", cancellationToken);
+    if (!sourceValidation.IsSuccess)
     {
-        var tokenResult = await services.CTraderTester.TestTokenEndpointAsync(cancellationToken);
-        if (!tokenResult.IsSuccess)
-        {
-            Console.Error.WriteLine($"Backtest failed: {tokenResult.Error}");
-            return 4;
-        }
-
-        if (!string.IsNullOrWhiteSpace(tokenResult.Value!.AccessToken) && !string.IsNullOrWhiteSpace(tokenResult.Value.RefreshToken))
-        {
-            await SaveCTraderTokensAsync(services.AppsettingsPath, tokenResult.Value.AccessToken, tokenResult.Value.RefreshToken, cancellationToken);
-            services.Options.CTrader.AccessToken = tokenResult.Value.AccessToken;
-            services.Options.CTrader.RefreshToken = tokenResult.Value.RefreshToken;
-        }
-    }
-    else if (string.Equals(services.Options.Backtesting.DataSource, "MT5", StringComparison.OrdinalIgnoreCase))
-    {
-        var brokerResult = await services.Broker.ValidateConnectionAsync(cancellationToken);
-        if (!brokerResult.IsSuccess)
-        {
-            Console.Error.WriteLine($"Backtest failed: {brokerResult.Error}");
-            return 4;
-        }
+        Console.Error.WriteLine(sourceValidation.Error);
+        return 4;
     }
 
     BacktestResult result;
@@ -317,6 +317,211 @@ static async Task<int> BacktestAsync(ServiceRegistry services, string[] args, Ca
     Console.WriteLine(JsonSerializer.Serialize(result.Metrics, new JsonSerializerOptions { WriteIndented = true }));
     Console.WriteLine($"CSV report: {path}");
     return 0;
+}
+
+static async Task<int> FindRecentSetupsAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
+{
+    if (!TryReadIntArg(args, "count", out var requestedCount))
+    {
+        Console.Error.WriteLine("Provide count=[number]. Example: find-recent-setups count=10");
+        return 2;
+    }
+
+    if (requestedCount <= 0 || requestedCount > RecentValidSetupCsvWriter.MaxRows)
+    {
+        Console.Error.WriteLine($"count must be between 1 and {RecentValidSetupCsvWriter.MaxRows}.");
+        return 2;
+    }
+
+    var maxDays = TryReadIntArg(args, "max_days", out var configuredMaxDays) ? configuredMaxDays : 30;
+    if (maxDays < 0)
+    {
+        Console.Error.WriteLine("max_days must be zero or greater. Use max_days=0 for an unbounded scan.");
+        return 2;
+    }
+
+    var sourceValidation = await ValidateHistoricalMarketDataSourceAsync(services, "Find recent setups", cancellationToken);
+    if (!sourceValidation.IsSuccess)
+    {
+        Console.Error.WriteLine(sourceValidation.Error);
+        return 4;
+    }
+
+    var historicalProvider = services.HistoricalMarketData;
+    var rows = new List<RecentValidSetupRow>();
+    var seenSetups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var now = DateTimeOffset.Now;
+    var firstSearchDay = PreviousTradingDayStart(now);
+    var currentDay = firstSearchDay;
+    var oldestScannedDay = firstSearchDay;
+    var scannedDays = 0;
+
+    while (rows.Count < requestedCount && rows.Count < RecentValidSetupCsvWriter.MaxRows && (maxDays == 0 || scannedDays < maxDays))
+    {
+        var dayStart = currentDay;
+        var dayEnd = currentDay.AddDays(1).AddMinutes(-5);
+        scannedDays++;
+
+        IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>> candles;
+        try
+        {
+            candles = await PreloadRecentSetupCandlesAsync(
+                historicalProvider,
+                services.Options.Symbol,
+                dayStart,
+                dayEnd,
+                services.Options.UseDailyBiasFilter,
+                requireCandles: currentDay == firstSearchDay,
+                cancellationToken);
+        }
+        catch (InvalidOperationException exception)
+        {
+            Console.Error.WriteLine($"Find recent setups failed: {exception.Message}");
+            return 4;
+        }
+
+        if (candles.Count == 0 || !candles.TryGetValue(Timeframe.M5, out var m5Candles) || m5Candles.Count == 0)
+        {
+            break;
+        }
+
+        var marketData = new InMemoryMarketDataProvider(candles);
+        var strategy = BuildStrategyEngine(services.Options, marketData, new NewsFilter(services.Options), new NewYorkSessionClock());
+
+        var cursorStep = ResolveAnalysisCursorStep(services.Options);
+        for (var cursor = dayEnd; cursor >= dayStart && rows.Count < requestedCount && rows.Count < RecentValidSetupCsvWriter.MaxRows; cursor = cursor.Subtract(cursorStep))
+        {
+            var signal = await strategy.AnalyzeAsync(services.Options.Symbol, cursor, cancellationToken);
+            if (!signal.IsValidSetup)
+            {
+                continue;
+            }
+
+            var setupKey = BuildSetupKey(signal);
+            if (!seenSetups.Add(setupKey))
+            {
+                continue;
+            }
+
+            rows.Add(new RecentValidSetupRow(
+                services.Options.ActiveStrategy.Id,
+                services.Options.ActiveStrategy.Name,
+                signal.Symbol,
+                cursor.ToUniversalTime(),
+                cursor.ToLocalTime(),
+                signal.Session.ToString(),
+                signal.Direction.ToString().ToUpperInvariant(),
+                signal.Session != SessionName.Closed,
+                signal.EntryPrice,
+                signal.StopLoss,
+                signal.TakeProfit,
+                signal.RiskReward,
+                signal.SetupReason,
+                historicalProvider.ProviderName));
+        }
+
+        oldestScannedDay = currentDay;
+        currentDay = PreviousTradingDayStart(currentDay);
+    }
+
+    var csvPath = await services.RecentSetups.WriteAsync(rows, cancellationToken);
+    PrintRecentSetupSearchSummary(services.Options, historicalProvider.ProviderName, oldestScannedDay, firstSearchDay.AddDays(1).AddMinutes(-5), requestedCount, rows.Count, scannedDays, maxDays, csvPath);
+    return rows.Count > 0 ? 0 : 1;
+}
+
+static TimeSpan ResolveAnalysisCursorStep(TradingBotOptions options) =>
+    string.Equals(options.ActiveStrategy.ExecutionTimeframe, "M1", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(options.ActiveStrategy.EntryTimeframe, "M1", StringComparison.OrdinalIgnoreCase)
+        ? TimeSpan.FromMinutes(1)
+        : TimeSpan.FromMinutes(5);
+
+static string BuildSetupKey(TradeSignal signal)
+{
+    if (!string.IsNullOrWhiteSpace(signal.SetupId))
+    {
+        return signal.SetupId;
+    }
+
+    return string.Join('|', signal.Symbol, signal.Direction, signal.EntryPrice, signal.StopLoss, signal.TakeProfit, signal.SetupReason);
+}
+
+static async Task<Result> ValidateHistoricalMarketDataSourceAsync(
+    ServiceRegistry services,
+    string commandName,
+    CancellationToken cancellationToken)
+{
+    var source = services.Options.ActiveBacktestingDataSource.DataSource;
+    if (string.Equals(source, "cTrader", StringComparison.OrdinalIgnoreCase))
+    {
+        var tokenResult = await services.CTraderTester.TestTokenEndpointAsync(cancellationToken);
+        if (!tokenResult.IsSuccess)
+        {
+            return Result.Failure($"{commandName} failed: {tokenResult.Error}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(tokenResult.Value!.AccessToken) && !string.IsNullOrWhiteSpace(tokenResult.Value.RefreshToken))
+        {
+            await SaveCTraderTokensAsync(services.AppsettingsPath, tokenResult.Value.AccessToken, tokenResult.Value.RefreshToken, cancellationToken);
+            services.Options.CTrader.AccessToken = tokenResult.Value.AccessToken;
+            services.Options.CTrader.RefreshToken = tokenResult.Value.RefreshToken;
+        }
+
+        return Result.Success();
+    }
+
+    if (string.Equals(source, "MT5", StringComparison.OrdinalIgnoreCase))
+    {
+        var health = await services.MT5Bridge.GetHealthAsync(cancellationToken);
+        return health.IsSuccess
+            ? Result.Success()
+            : Result.Failure($"{commandName} failed: {health.Error}");
+    }
+
+    return Result.Failure($"{commandName} failed: unsupported enabled market-data source '{source}'.");
+}
+
+static async Task<IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>>> PreloadRecentSetupCandlesAsync(
+    IHistoricalMarketDataProvider provider,
+    string symbol,
+    DateTimeOffset dayStart,
+    DateTimeOffset to,
+    bool includeDaily,
+    bool requireCandles,
+    CancellationToken cancellationToken)
+{
+    var requests = includeDaily
+        ? new[]
+        {
+            new HistoricalDataRequest(symbol, Timeframe.D1, dayStart.AddDays(-60), to),
+            new HistoricalDataRequest(symbol, Timeframe.H1, dayStart.AddDays(-10), to),
+            new HistoricalDataRequest(symbol, Timeframe.M1, dayStart.AddHours(-6), to),
+            new HistoricalDataRequest(symbol, Timeframe.M5, dayStart.AddHours(-12), to)
+        }
+        : new[]
+        {
+            new HistoricalDataRequest(symbol, Timeframe.H1, dayStart.AddDays(-10), to),
+            new HistoricalDataRequest(symbol, Timeframe.M1, dayStart.AddHours(-6), to),
+            new HistoricalDataRequest(symbol, Timeframe.M5, dayStart.AddHours(-12), to)
+        };
+    var result = new Dictionary<Timeframe, IReadOnlyList<Candle>>();
+
+    foreach (var request in requests)
+    {
+        var candles = await provider.GetCandlesAsync(request, cancellationToken);
+        if (candles.Count == 0)
+        {
+            if (!requireCandles)
+            {
+                return new Dictionary<Timeframe, IReadOnlyList<Candle>>();
+            }
+
+            throw new InvalidOperationException($"Historical provider '{provider.ProviderName}' returned no {request.Timeframe} candles for {symbol}.");
+        }
+
+        result[request.Timeframe] = candles.OrderBy(candle => candle.OpenedAt).ToArray();
+    }
+
+    return result;
 }
 
 static async Task<int> BacktestLearningAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
@@ -445,156 +650,6 @@ static async Task<int> DownloadHistoryAsync(ServiceRegistry services, string[] a
     }, new JsonSerializerOptions { WriteIndented = true }));
 
     return candles.Count > 0 ? 0 : 1;
-}
-
-static async Task<int> FindSignalAsync(ServiceRegistry services, string[] args, CancellationToken cancellationToken)
-{
-    var symbol = ReadKeyValueArg(args, "symbol") ?? services.Options.Symbol;
-    var screenshots = await CaptureTradingViewScreenshotsAsync(services.Options, symbol, cancellationToken);
-    Console.WriteLine(JsonSerializer.Serialize(new
-    {
-        symbol,
-        screenshots = screenshots.Select(item => new { item.Timeframe, item.Path, item.IsCaptured, item.Message })
-    }, new JsonSerializerOptions { WriteIndented = true }));
-
-    var brokerResult = await PrepareConfiguredBrokerForMarketDataAsync(services, cancellationToken);
-    if (!brokerResult.IsSuccess)
-    {
-        Console.Error.WriteLine(brokerResult.Error);
-        return 3;
-    }
-
-    var signal = await services.Strategy.AnalyzeAsync(symbol, DateTimeOffset.UtcNow, cancellationToken);
-    if (!signal.IsValidSetup)
-    {
-        Console.WriteLine(JsonSerializer.Serialize(new
-        {
-            isSignalFound = false,
-            signal.SetupReason,
-            signal.Session
-        }, new JsonSerializerOptions { WriteIndented = true }));
-        return 1;
-    }
-
-    var report = new SignalReport(
-        $"signal-{symbol}-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}",
-        signal.Symbol,
-        signal.Session.ToString(),
-        signal.Direction.ToString().ToUpperInvariant(),
-        signal.EntryPrice,
-        signal.StopLoss,
-        signal.TakeProfit,
-        signal.RiskReward,
-        DateTimeOffset.UtcNow,
-        signal.SetupReason,
-        screenshots.FirstOrDefault(item => item.Timeframe == "1h")?.Path ?? "",
-        screenshots.FirstOrDefault(item => item.Timeframe == "5m")?.Path ?? "",
-        screenshots.FirstOrDefault(item => item.Timeframe == "1m")?.Path ?? "");
-
-    var written = await services.SignalTracker.AppendAsync([report], cancellationToken);
-    Console.WriteLine(JsonSerializer.Serialize(new
-    {
-        isSignalFound = true,
-        signal = report,
-        csvRowsWritten = written
-    }, new JsonSerializerOptions { WriteIndented = true }));
-
-    return 0;
-}
-
-static async Task<IReadOnlyList<ScreenshotCaptureResult>> CaptureTradingViewScreenshotsAsync(
-    TradingBotOptions options,
-    string symbol,
-    CancellationToken cancellationToken)
-{
-    Directory.CreateDirectory(options.TradingView.ScreenshotDirectory);
-    var browser = ResolveBrowserPath(options);
-    var requests = new[]
-    {
-        new { Timeframe = "1h", Interval = "60" },
-        new { Timeframe = "5m", Interval = "5" },
-        new { Timeframe = "1m", Interval = "1" }
-    };
-    var results = new List<ScreenshotCaptureResult>();
-
-    foreach (var request in requests)
-    {
-        var path = Path.GetFullPath(Path.Combine(
-            options.TradingView.ScreenshotDirectory,
-            $"{symbol}_{request.Timeframe}.{options.TradingView.ScreenshotExtension.TrimStart('.')}"));
-        var url = BuildTradingViewChartUrl(options, request.Interval);
-
-        if (browser is null)
-        {
-            results.Add(new ScreenshotCaptureResult(request.Timeframe, path, false, "No supported browser executable was found for headless screenshot capture."));
-            continue;
-        }
-
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-        }
-        catch (Exception exception)
-        {
-            results.Add(new ScreenshotCaptureResult(request.Timeframe, path, false, $"Unable to replace existing screenshot: {exception.Message}"));
-            continue;
-        }
-
-        var processInfo = new ProcessStartInfo
-        {
-            FileName = browser,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        processInfo.ArgumentList.Add("--headless=new");
-        processInfo.ArgumentList.Add("--disable-gpu");
-        processInfo.ArgumentList.Add($"--window-size={options.TradingView.ScreenshotWidth},{options.TradingView.ScreenshotHeight}");
-        processInfo.ArgumentList.Add($"--screenshot={path}");
-        processInfo.ArgumentList.Add(url);
-
-        using var screenshotProcess = Process.Start(processInfo);
-        if (screenshotProcess is null)
-        {
-            results.Add(new ScreenshotCaptureResult(request.Timeframe, path, false, "Unable to start browser screenshot process."));
-            continue;
-        }
-
-        await screenshotProcess.WaitForExitAsync(cancellationToken);
-        results.Add(new ScreenshotCaptureResult(
-            request.Timeframe,
-            path,
-            screenshotProcess.ExitCode == 0 && File.Exists(path),
-            screenshotProcess.ExitCode == 0 && File.Exists(path) ? "Captured." : $"Browser exited with code {screenshotProcess.ExitCode}."));
-    }
-
-    return results;
-}
-
-static string BuildTradingViewChartUrl(TradingBotOptions options, string interval)
-{
-    var symbol = Uri.EscapeDataString(options.TradingView.Symbol);
-    return $"https://www.tradingview.com/chart/?symbol={symbol}&interval={Uri.EscapeDataString(interval)}";
-}
-
-static string? ResolveBrowserPath(TradingBotOptions options)
-{
-    if (!string.IsNullOrWhiteSpace(options.TradingView.BrowserPath) && File.Exists(options.TradingView.BrowserPath))
-    {
-        return options.TradingView.BrowserPath;
-    }
-
-    var candidates = new[]
-    {
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe"),
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe")
-    };
-
-    return candidates.FirstOrDefault(File.Exists);
 }
 
 static async Task<int> CTraderRequestTokenAsync(ServiceRegistry services, CancellationToken cancellationToken)
@@ -1024,9 +1079,13 @@ static async Task<Result> ValidateActiveTradeLimitAsync(
     ServiceRegistry services,
     string cycleId,
     bool formattedOutput,
-    CancellationToken cancellationToken)
+    CancellationToken cancellationToken,
+    ActiveTradeSummary? knownSummary = null,
+    bool printSummary = true)
 {
-    var summaryResult = await GetActiveTradeSummaryAsync(services, cancellationToken);
+    var summaryResult = knownSummary is not null
+        ? Result<ActiveTradeSummary>.Success(knownSummary)
+        : await GetActiveTradeSummaryAsync(services, cancellationToken);
     if (!summaryResult.IsSuccess)
     {
         await services.Monitor.WriteAsync(cycleId, "active_trade_check_failed", new
@@ -1051,7 +1110,7 @@ static async Task<Result> ValidateActiveTradeLimitAsync(
         maxActiveTrades = GetMaxActiveTrades(services.Options)
     }, cancellationToken);
 
-    if (formattedOutput)
+    if (formattedOutput && printSummary)
     {
         PrintActiveTradeSummary(summary, GetMaxActiveTrades(services.Options));
     }
@@ -1069,6 +1128,45 @@ static async Task<Result> ValidateActiveTradeLimitAsync(
     }
 
     return Result.Success();
+}
+
+static async Task<Result<ActiveTradeSummary>> ReportBrokerOrderStatusAsync(
+    ServiceRegistry services,
+    string cycleId,
+    bool formattedOutput,
+    CancellationToken cancellationToken)
+{
+    var summaryResult = await GetActiveTradeSummaryAsync(services, cancellationToken);
+    if (!summaryResult.IsSuccess)
+    {
+        await services.Monitor.WriteAsync(cycleId, "broker_order_status_failed", new
+        {
+            summaryResult.Error
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintFailure("Broker Orders", summaryResult.Error!);
+        }
+
+        return Result<ActiveTradeSummary>.Failure(summaryResult.Error!);
+    }
+
+    var summary = summaryResult.Value!;
+    await services.Monitor.WriteAsync(cycleId, "broker_order_status_checked", new
+    {
+        summary.OpenPositions,
+        summary.PendingOrders,
+        summary.TotalActiveTrades,
+        maxActiveTrades = GetMaxActiveTrades(services.Options)
+    }, cancellationToken);
+
+    if (formattedOutput)
+    {
+        PrintBrokerOrderStatus(summary, GetMaxActiveTrades(services.Options));
+    }
+
+    return Result<ActiveTradeSummary>.Success(summary);
 }
 
 static async Task<Result> ValidateMarketExecutionGuardAsync(
@@ -1230,6 +1328,83 @@ static async Task<Result<TradeTrackingCycleResult>> TrackClosedTradesAsync(
         services.Options.TradeTracking.Directory));
 }
 
+static async Task<Result<DailyTradingStopStatus>> ValidateDailyTradingStopAsync(
+    ServiceRegistry services,
+    string cycleId,
+    CancellationToken cancellationToken)
+{
+    var options = services.Options.DailyTradingStop;
+    var now = DateTimeOffset.Now;
+    var dayStart = new DateTimeOffset(now.Date, now.Offset);
+    var dayEnd = dayStart.AddDays(1);
+
+    if (!options.Enabled)
+    {
+        return Result<DailyTradingStopStatus>.Success(new DailyTradingStopStatus(
+            false,
+            0,
+            0,
+            options.MaxWinningTradesPerDay,
+            options.MaxLosingTradesPerDay,
+            dayStart,
+            dayEnd,
+            "Daily trading stop is disabled."));
+    }
+
+    if (!IsBroker(services.Options, "MT5"))
+    {
+        return Result<DailyTradingStopStatus>.Success(new DailyTradingStopStatus(
+            false,
+            0,
+            0,
+            options.MaxWinningTradesPerDay,
+            options.MaxLosingTradesPerDay,
+            dayStart,
+            dayEnd,
+            "Daily trading stop currently checks MT5 closed trades only."));
+    }
+
+    var trades = await services.MT5Bridge.GetClosedTradesAsync(dayStart, now, cancellationToken);
+    if (!trades.IsSuccess)
+    {
+        return Result<DailyTradingStopStatus>.Failure(trades.Error!);
+    }
+
+    var todaysTrades = trades.Value!
+        .Where(trade => trade.ClosedAt >= dayStart && trade.ClosedAt < dayEnd)
+        .ToArray();
+    var winningTrades = todaysTrades.Count(trade => trade.NetProfit > 0m);
+    var losingTrades = todaysTrades.Count(trade => trade.NetProfit < 0m);
+    var isWinLimitReached = winningTrades >= options.MaxWinningTradesPerDay;
+    var isLossLimitReached = losingTrades >= options.MaxLosingTradesPerDay;
+    var reason = isWinLimitReached
+        ? $"Daily trading stopped after {winningTrades} winning trade(s)."
+        : isLossLimitReached
+            ? $"Daily trading stopped after {losingTrades} losing trade(s)."
+            : "Daily trading stop limits not reached.";
+
+    await services.Monitor.WriteAsync(cycleId, "daily_trading_stop_checked", new
+    {
+        winningTrades,
+        losingTrades,
+        options.MaxWinningTradesPerDay,
+        options.MaxLosingTradesPerDay,
+        dayStart,
+        now,
+        isHalted = isWinLimitReached || isLossLimitReached
+    }, cancellationToken);
+
+    return Result<DailyTradingStopStatus>.Success(new DailyTradingStopStatus(
+        isWinLimitReached || isLossLimitReached,
+        winningTrades,
+        losingTrades,
+        options.MaxWinningTradesPerDay,
+        options.MaxLosingTradesPerDay,
+        dayStart,
+        dayEnd,
+        reason));
+}
+
 static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
     ServiceRegistry services,
     bool requireLiveConfirmation,
@@ -1315,6 +1490,88 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
 
     await services.Monitor.WriteAsync(cycleId, "broker_validation_succeeded", new { }, cancellationToken);
 
+    var dailyTradingStop = await ValidateDailyTradingStopAsync(services, cycleId, cancellationToken);
+    if (!dailyTradingStop.IsSuccess)
+    {
+        await services.Monitor.WriteAsync(cycleId, "daily_trading_stop_check_failed", new
+        {
+            dailyTradingStop.Error
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintCycleHeader(services.Options, new TradeSignal(
+                services.Options.Symbol,
+                TradeDirection.Buy,
+                0m,
+                0m,
+                0m,
+                0m,
+                SessionName.Closed,
+                false,
+                "Daily trading stop check failed."));
+            PrintFailure("Daily Trading Stop", dailyTradingStop.Error!);
+        }
+        else
+        {
+            Console.Error.WriteLine(dailyTradingStop.Error);
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = dailyTradingStop.Error,
+            exitCode = 4
+        }, cancellationToken);
+        return 4;
+    }
+
+    if (dailyTradingStop.Value!.IsHalted)
+    {
+        await services.Monitor.WriteAsync(cycleId, "daily_trading_halted", new
+        {
+            dailyTradingStop.Value.WinningTrades,
+            dailyTradingStop.Value.LosingTrades,
+            dailyTradingStop.Value.MaxWinningTrades,
+            dailyTradingStop.Value.MaxLosingTrades,
+            dailyTradingStop.Value.TradingDayStart,
+            dailyTradingStop.Value.TradingDayEnd,
+            dailyTradingStop.Value.Reason
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintCycleHeader(services.Options, new TradeSignal(
+                services.Options.Symbol,
+                TradeDirection.Buy,
+                0m,
+                0m,
+                0m,
+                0m,
+                SessionName.Closed,
+                false,
+                dailyTradingStop.Value.Reason));
+            PrintDailyTradingStop(dailyTradingStop.Value);
+        }
+        else
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new
+            {
+                isOrderCreated = false,
+                reason = dailyTradingStop.Value.Reason,
+                dailyTradingStop = dailyTradingStop.Value
+            }, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = dailyTradingStop.Value.Reason,
+            exitCode = 1
+        }, cancellationToken);
+        return 1;
+    }
+
     var signal = await services.Strategy.AnalyzeAsync(services.Options.Symbol, DateTimeOffset.UtcNow, cancellationToken);
     await services.Monitor.WriteAsync(cycleId, "strategy_analyzed", new
     {
@@ -1329,9 +1586,15 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
         signal.RiskReward
     }, cancellationToken);
 
+    ActiveTradeSummary? cycleActiveTradeSummary = null;
     if (formattedOutput)
     {
         PrintCycleHeader(services.Options, signal);
+        var brokerOrderStatus = await ReportBrokerOrderStatusAsync(services, cycleId, formattedOutput, cancellationToken);
+        if (brokerOrderStatus.IsSuccess)
+        {
+            cycleActiveTradeSummary = brokerOrderStatus.Value;
+        }
     }
 
     if (!signal.IsValidSetup)
@@ -1495,7 +1758,9 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
         services,
         cycleId,
         formattedOutput,
-        cancellationToken);
+        cancellationToken,
+        cycleActiveTradeSummary,
+        printSummary: cycleActiveTradeSummary is null);
     if (!activeTradeValidation.IsSuccess)
     {
         if (!formattedOutput)
@@ -1645,6 +1910,8 @@ static async Task<Result<BrokerOrderCreationResult>> CreateConfiguredBrokerOrder
 
 static async Task<Result<AccountSnapshot>> GetAccountSnapshotAsync(ServiceRegistry services, CancellationToken cancellationToken)
 {
+    var configuredInitialBalance = services.Options.ActiveFundedAccountChallenge?.InitialBalance ?? 0m;
+
     if (IsBroker(services.Options, "MT5"))
     {
         var snapshot = await services.MT5Bridge.GetAccountSnapshotAsync(cancellationToken);
@@ -1653,8 +1920,8 @@ static async Task<Result<AccountSnapshot>> GetAccountSnapshotAsync(ServiceRegist
             var value = snapshot.Value;
             snapshot = Result<AccountSnapshot>.Success(value with
             {
-                InitialBalance = services.Options.FTMOChallenge.InitialBalance > 0m
-                    ? services.Options.FTMOChallenge.InitialBalance
+                InitialBalance = configuredInitialBalance > 0m
+                    ? configuredInitialBalance
                     : services.Options.AccountBalance
             });
         }
@@ -1670,7 +1937,7 @@ static async Task<Result<AccountSnapshot>> GetAccountSnapshotAsync(ServiceRegist
                 0,
                 0,
                 services.Options.AccountBalance,
-                services.Options.FTMOChallenge.InitialBalance > 0m ? services.Options.FTMOChallenge.InitialBalance : services.Options.AccountBalance,
+                configuredInitialBalance > 0m ? configuredInitialBalance : services.Options.AccountBalance,
                 0));
 }
 
@@ -1758,6 +2025,15 @@ static bool TryReadDecimalArg(string[] args, string name, out decimal value)
         && decimal.TryParse(raw[prefix.Length..], System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out value);
 }
 
+static bool TryReadIntArg(string[] args, string name, out int value)
+{
+    value = 0;
+    var prefix = $"{name}=";
+    var raw = args.FirstOrDefault(arg => arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+    return raw is not null
+        && int.TryParse(raw[prefix.Length..], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
+}
+
 static bool HasFlagArg(string[] args, string name, string expectedValue)
 {
     var prefix = $"{name}=";
@@ -1782,6 +2058,17 @@ static string? ReadKeyValueArg(string[] args, string name)
     return raw is null ? null : raw[prefix.Length..];
 }
 
+static DateTimeOffset PreviousTradingDayStart(DateTimeOffset timestamp)
+{
+    var day = new DateTimeOffset(timestamp.Date.AddDays(-1), timestamp.Offset);
+    while (day.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+    {
+        day = day.AddDays(-1);
+    }
+
+    return day;
+}
+
 static int Help()
 {
     Console.WriteLine("Usage:");
@@ -1789,9 +2076,9 @@ static int Help()
     PrintCommand("stop", "Logs a safe shutdown request. No daemon state is active yet.");
     PrintCommand("analyze", "Runs one Smart Money strategy analysis cycle and prints the generated signal.");
     PrintCommand("backtest --from 2025-05-15 --to 2026-05-15", "Runs a backtest from cTrader historical candles and writes a CSV report.");
+    PrintCommand("find-recent-setups count=10 [max_days=30]", "Finds valid setups starting from the previous trading day and scanning backward by trading day using the first enabled historical source, then writes a CSV report.");
     PrintCommand("backtest-learning --date 2026-05-19", "Scans one date for a valid setup and writes a learning chart plus PDF report.");
     PrintCommand("download-history --from 2025-05-15 --to 2026-05-15 timeframe=M5", "Downloads/caches historical candles from the configured backtesting provider.");
-    PrintCommand("find-signal [symbol=EURUSD]", "Captures TradingView 1h/5m/1m screenshots and reports a valid strategy signal when found.");
     PrintCommand("ctrader-connect", "Runs cTrader authorization and then verifies OAuth token connectivity.");
     PrintCommand("ctrader-authorize", "Starts the local OAuth callback, opens cTrader authorization, and saves tokens.");
     PrintCommand("ctrader-request-token", "Refreshes cTrader OAuth tokens and verifies token endpoint connectivity.");
@@ -1821,6 +2108,8 @@ static void PrintCycleHeader(TradingBotOptions options, TradeSignal signal)
     Console.WriteLine($" TradingBot Analysis Cycle - {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
     Console.WriteLine("============================================================");
     Console.WriteLine($"Broker : {options.Broker}");
+    Console.WriteLine($"Strategy: {options.ActiveStrategy.Name}");
+    Console.WriteLine($"Engine : {options.ActiveStrategy.Engine}");
     Console.WriteLine($"Symbol : {signal.Symbol}");
     Console.WriteLine($"Session: {signal.Session}");
 }
@@ -1894,10 +2183,58 @@ static void PrintTradeTracking(int fetchedTrades, int writtenTrades, string dire
     Console.WriteLine($"Directory     : {directory}");
 }
 
+static void PrintDailyTradingStop(DailyTradingStopStatus status)
+{
+    Console.WriteLine();
+    Console.WriteLine("Daily Stop    : HALTED");
+    Console.WriteLine($"Reason        : {status.Reason}");
+    Console.WriteLine($"Winning Trades: {status.WinningTrades} / {status.MaxWinningTrades}");
+    Console.WriteLine($"Losing Trades : {status.LosingTrades} / {status.MaxLosingTrades}");
+    Console.WriteLine($"Trading Day   : {status.TradingDayStart:yyyy-MM-dd HH:mm:ss zzz} -> {status.TradingDayEnd:yyyy-MM-dd HH:mm:ss zzz}");
+    Console.WriteLine("Action        : No analysis or order creation until the next trading day.");
+}
+
+static void PrintRecentSetupSearchSummary(
+    TradingBotOptions options,
+    string source,
+    DateTimeOffset from,
+    DateTimeOffset to,
+    int requested,
+    int found,
+    int scannedDays,
+    int maxDays,
+    string csvPath)
+{
+    Console.WriteLine();
+    Console.WriteLine("Recent Valid Setup Search");
+    Console.WriteLine($"Source   : {source}");
+    Console.WriteLine($"Strategy : {options.ActiveStrategy.Name}");
+    Console.WriteLine($"Symbol   : {options.Symbol}");
+    Console.WriteLine($"Window   : {from:yyyy-MM-dd HH:mm:ss zzz} -> {to:yyyy-MM-dd HH:mm:ss zzz}");
+    Console.WriteLine($"Requested: {requested}");
+    Console.WriteLine($"Found    : {found}");
+    Console.WriteLine($"Days Scan: {scannedDays}{(maxDays == 0 ? " (unbounded)" : $" / {maxDays}")}");
+    Console.WriteLine($"CSV      : {csvPath}");
+    if (found == 0)
+    {
+        Console.WriteLine("Reason   : No valid setups found in the scanned trading days.");
+    }
+}
+
 static void PrintActiveTradeSummary(ActiveTradeSummary summary, int maxActiveTrades)
 {
     Console.WriteLine();
     Console.WriteLine("Active Trades: CHECKED");
+    Console.WriteLine($"Open Pos.    : {summary.OpenPositions}");
+    Console.WriteLine($"Pending Ord. : {summary.PendingOrders}");
+    Console.WriteLine($"Total Active : {summary.TotalActiveTrades}");
+    Console.WriteLine($"Max Allowed  : {maxActiveTrades}");
+}
+
+static void PrintBrokerOrderStatus(ActiveTradeSummary summary, int maxActiveTrades)
+{
+    Console.WriteLine();
+    Console.WriteLine("Broker Orders: CHECKED");
     Console.WriteLine($"Open Pos.    : {summary.OpenPositions}");
     Console.WriteLine($"Pending Ord. : {summary.PendingOrders}");
     Console.WriteLine($"Total Active : {summary.TotalActiveTrades}");
@@ -2085,21 +2422,49 @@ internal sealed record ServiceRegistry(
     CTraderJsonApiClient CTraderJsonApi,
     MT5BridgeClient MT5Bridge,
     IHistoricalMarketDataProvider HistoricalMarketData,
-    SmartMoneyStrategyEngine Strategy,
+    IStrategyEngine Strategy,
     RiskManager Risk,
     BacktestingEngine Backtesting,
     CsvJournalWriter Journal,
+    RecentValidSetupCsvWriter RecentSetups,
     OperationalLogWriter Monitor,
-    ClosedTradeTrackingWriter TradeTracker,
-    SignalTrackingWriter SignalTracker);
+    ClosedTradeTrackingWriter TradeTracker);
 
 internal sealed record TradeTrackingCycleResult(
     int FetchedTrades,
     int WrittenTrades,
     string Directory);
 
-internal sealed record ScreenshotCaptureResult(
-    string Timeframe,
-    string Path,
-    bool IsCaptured,
-    string Message);
+internal sealed record DailyTradingStopStatus(
+    bool IsHalted,
+    int WinningTrades,
+    int LosingTrades,
+    int MaxWinningTrades,
+    int MaxLosingTrades,
+    DateTimeOffset TradingDayStart,
+    DateTimeOffset TradingDayEnd,
+    string Reason);
+
+internal sealed class InMemoryMarketDataProvider(IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>> candles) : IMarketDataProvider
+{
+    public Task<IReadOnlyList<Candle>> GetCandlesAsync(
+        string symbol,
+        Timeframe timeframe,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        CancellationToken cancellationToken)
+    {
+        if (!candles.TryGetValue(timeframe, out var timeframeCandles))
+        {
+            return Task.FromResult<IReadOnlyList<Candle>>([]);
+        }
+
+        var filtered = timeframeCandles
+            .Where(candle => string.Equals(candle.Symbol, symbol, StringComparison.OrdinalIgnoreCase)
+                && candle.OpenedAt >= from
+                && candle.OpenedAt <= to)
+            .OrderBy(candle => candle.OpenedAt)
+            .ToArray();
+        return Task.FromResult<IReadOnlyList<Candle>>(filtered);
+    }
+}

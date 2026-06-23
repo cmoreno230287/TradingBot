@@ -16,11 +16,14 @@ public static class JsonOptionsLoader
         if (!File.Exists(path))
         {
             var defaults = new TradingBotOptions();
+            defaults.Normalize();
             File.WriteAllText(path, JsonSerializer.Serialize(defaults, SerializerOptions));
             return defaults;
         }
 
         var json = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<TradingBotOptions>(json, SerializerOptions) ?? new TradingBotOptions();
+        var options = JsonSerializer.Deserialize<TradingBotOptions>(json, SerializerOptions) ?? new TradingBotOptions();
+        options.Normalize();
+        return options;
     }
 }

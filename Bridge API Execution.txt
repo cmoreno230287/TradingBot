@@ -1,4 +1,8 @@
+============= Executing the MT5 Bridge ==================
 cd C:\Projects\TradingBot
 .\.venv-mt5\Scripts\Activate.ps1
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python tools\mt5-bridge\mt5_bridge.py --host 127.0.0.1 --port 5010
+
+============= Executing the Bot ========================
+dotnet run --project TradingBot.CLI -- start mode=tracking
