@@ -2,6 +2,7 @@ param(
     [string]$TradingBotRoot = "C:\TradingBot",
     [string]$BridgeHost = "127.0.0.1",
     [int]$BridgePort = 5010,
+    [string]$TerminalPath = "C:\Program Files\FTMO Global Markets MT5 Terminal",
     [string]$BotMode = "tracking",
     [int]$BridgeStartupTimeoutSeconds = 90
 )
@@ -32,14 +33,21 @@ function Test-BridgeHealth {
 }
 
 $botExe = Join-Path $TradingBotRoot "TradingBot.CLI.exe"
-$venvActivate = Join-Path $TradingBotRoot ".venv-mt5\Scripts\Activate.ps1"
+$pythonExe = Join-Path $TradingBotRoot ".venv-mt5\Scripts\python.exe"
 $bridgeScript = Join-Path $TradingBotRoot "tools\mt5-bridge\mt5_bridge.py"
 $healthUrl = "http://${BridgeHost}:${BridgePort}/health"
+$terminalExe = if ((Split-Path -Leaf $TerminalPath) -ieq "terminal64.exe") {
+    $TerminalPath
+}
+else {
+    Join-Path $TerminalPath "terminal64.exe"
+}
 
 Assert-PathExists -Path $TradingBotRoot -Description "TradingBot root folder"
 Assert-PathExists -Path $botExe -Description "TradingBot executable"
-Assert-PathExists -Path $venvActivate -Description "MT5 bridge virtual environment activation script"
+Assert-PathExists -Path $pythonExe -Description "MT5 bridge Python executable"
 Assert-PathExists -Path $bridgeScript -Description "MT5 bridge script"
+Assert-PathExists -Path $terminalExe -Description "MT5 terminal executable"
 
 Set-Location -LiteralPath $TradingBotRoot
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
@@ -50,16 +58,16 @@ if (-not (Test-BridgeHealth -HealthUrl $healthUrl)) {
     $bridgeCommand = @"
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 cd "$TradingBotRoot"
-. "$venvActivate"
-python "$bridgeScript" --host $BridgeHost --port $BridgePort
+& "$pythonExe" "$bridgeScript" --host "$BridgeHost" --port "$BridgePort" --terminal-path "$terminalExe"
 "@
 
+    $encodedBridgeCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bridgeCommand))
     Start-Process powershell.exe -ArgumentList @(
         "-NoExit",
         "-ExecutionPolicy",
         "Bypass",
-        "-Command",
-        $bridgeCommand
+        "-EncodedCommand",
+        $encodedBridgeCommand
     ) -WorkingDirectory $TradingBotRoot
 
     $deadline = (Get-Date).AddSeconds($BridgeStartupTimeoutSeconds)
