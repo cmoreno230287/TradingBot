@@ -161,27 +161,35 @@ static async Task<int> StartAsync(ServiceRegistry services, string[] args, Cance
     {
         try
         {
-            ClearConsoleFully();
             var cycleResult = await CaptureConsoleOutputAsync(() => ExecuteAnalyzeAndCreateOrderAsync(
                     services,
                     requireLiveConfirmation: false,
                     formattedOutput: true,
                     showTokenRecoveryHint: !authorizationPromptShown,
                     cancellationToken));
-            ClearConsoleFully();
-            WriteCapturedOutput(cycleResult);
 
+            CapturedConsoleOutput? trackingOutput = null;
             if (trackingMode)
             {
-                var trackingResult = await TrackClosedTradesAsync(services, cancellationToken);
-                if (trackingResult.IsSuccess)
+                trackingOutput = await CaptureConsoleOutputAsync(async () =>
                 {
-                    PrintTradeTracking(trackingResult.Value!.FetchedTrades, trackingResult.Value.WrittenTrades, trackingResult.Value.Directory);
-                }
-                else
-                {
+                    var trackingResult = await TrackClosedTradesAsync(services, cancellationToken);
+                    if (trackingResult.IsSuccess)
+                    {
+                        PrintTradeTracking(trackingResult.Value!.FetchedTrades, trackingResult.Value.WrittenTrades, trackingResult.Value.Directory);
+                        return 0;
+                    }
+
                     PrintFailure("Trade Tracking", trackingResult.Error!);
-                }
+                    return 4;
+                });
+            }
+
+            ClearConsoleFully();
+            WriteCapturedOutput(cycleResult);
+            if (trackingOutput is not null)
+            {
+                WriteCapturedOutput(trackingOutput);
             }
 
             var cycleExitCode = cycleResult.ExitCode;
@@ -1238,6 +1246,76 @@ static async Task<Result> ValidateMarketExecutionGuardAsync(
     return Result.Success();
 }
 
+static async Task<Result> ValidatePendingLimitOrderPlacementAsync(
+    ServiceRegistry services,
+    string cycleId,
+    TradeSignal signal,
+    bool formattedOutput,
+    CancellationToken cancellationToken)
+{
+    if (!IsBroker(services.Options, "MT5"))
+    {
+        return Result.Success();
+    }
+
+    var snapshot = await services.MT5Bridge.GetMarketExecutionSnapshotAsync(signal.Symbol, cancellationToken);
+    if (!snapshot.IsSuccess)
+    {
+        await services.Monitor.WriteAsync(cycleId, "pending_limit_guard_failed", new
+        {
+            snapshot.Error
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintFailure("Pending Limit Guard", snapshot.Error!);
+        }
+
+        return Result.Failure(snapshot.Error!);
+    }
+
+    var value = snapshot.Value!;
+    await services.Monitor.WriteAsync(cycleId, "pending_limit_guard_checked", new
+    {
+        signal.Symbol,
+        direction = signal.Direction.ToString(),
+        entryPrice = signal.EntryPrice,
+        value.Bid,
+        value.Ask
+    }, cancellationToken);
+
+    string? rejectionReason = signal.Direction switch
+    {
+        TradeDirection.Buy when signal.EntryPrice >= value.Ask =>
+            $"BUY LIMIT entry is no longer valid. Entry must be below current ask. Entry={signal.EntryPrice}, Ask={value.Ask}. No order created.",
+        TradeDirection.Sell when signal.EntryPrice <= value.Bid =>
+            $"SELL LIMIT entry is no longer valid. Entry must be above current bid. Entry={signal.EntryPrice}, Bid={value.Bid}. No order created.",
+        _ => null
+    };
+
+    if (rejectionReason is null)
+    {
+        return Result.Success();
+    }
+
+    await services.Monitor.WriteAsync(cycleId, "pending_limit_guard_rejected", new
+    {
+        reason = rejectionReason,
+        signal.Symbol,
+        direction = signal.Direction.ToString(),
+        entryPrice = signal.EntryPrice,
+        value.Bid,
+        value.Ask
+    }, cancellationToken);
+
+    if (formattedOutput)
+    {
+        PrintFailure("Pending Limit Guard", rejectionReason);
+    }
+
+    return Result.Failure(rejectionReason);
+}
+
 static async Task<Result> CleanupStalePendingOrdersAsync(
     ServiceRegistry services,
     string cycleId,
@@ -1364,7 +1442,7 @@ static async Task<Result<DailyTradingStopStatus>> ValidateDailyTradingStopAsync(
             "Daily trading stop currently checks MT5 closed trades only."));
     }
 
-    var trades = await services.MT5Bridge.GetClosedTradesAsync(dayStart, now, cancellationToken);
+    var trades = await services.MT5Bridge.GetClosedTradesAsync(dayStart, dayEnd, cancellationToken);
     if (!trades.IsSuccess)
     {
         return Result<DailyTradingStopStatus>.Failure(trades.Error!);
@@ -1732,6 +1810,23 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
         {
             isOrderCreated = false,
             reason = marketGuard.Error,
+            exitCode = 4
+        }, cancellationToken);
+        return 4;
+    }
+
+    var pendingLimitGuard = await ValidatePendingLimitOrderPlacementAsync(services, cycleId, signal, formattedOutput, cancellationToken);
+    if (!pendingLimitGuard.IsSuccess)
+    {
+        if (!formattedOutput)
+        {
+            Console.Error.WriteLine(pendingLimitGuard.Error);
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = pendingLimitGuard.Error,
             exitCode = 4
         }, cancellationToken);
         return 4;
