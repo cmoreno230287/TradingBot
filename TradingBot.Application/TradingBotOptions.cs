@@ -84,6 +84,10 @@ public sealed class TradingBotOptions
     public decimal MinFvgSizePips { get; set; } = 1.0m;
     [JsonIgnore]
     public string FvgEntryMode { get; set; } = "Dynamic";
+    [JsonIgnore]
+    public decimal FVGPercentBoundary { get; set; } = 20m;
+    [JsonIgnore]
+    public bool AllowOrderBlockEntry { get; set; } = true;
     public string DefaultFvgEntryMode { get; set; } = "Midpoint";
     public bool AllowBoundaryEntryOnStrongDisplacement { get; set; } = true;
     public bool AllowM1ConfirmationEntry { get; set; } = true;
@@ -118,6 +122,7 @@ public sealed class TradingBotOptions
     public OperationalMonitoringOptions OperationalMonitoring { get; set; } = new();
     public TradeTrackingOptions TradeTracking { get; set; } = new();
     public DailyTradingStopOptions DailyTradingStop { get; set; } = new();
+    public ForexMarketSessionOptions ForexMarketSessions { get; set; } = new();
     public TradingSessionOptions TradingSessions { get; set; } = new();
 
     [JsonIgnore]
@@ -163,6 +168,8 @@ public sealed class TradingBotOptions
         MaxSetupAgeCandlesM5 = strategy.MaxSetupAgeCandlesM5;
         MinFvgSizePips = strategy.MinFvgSizePips;
         FvgEntryMode = strategy.FvgEntryMode;
+        FVGPercentBoundary = strategy.FVGPercentBoundary;
+        AllowOrderBlockEntry = strategy.AllowOrderBlockEntry;
         RequireDisplacement = strategy.RequireDisplacement;
         DisplacementMinBodyToRangeRatio = strategy.DisplacementMinBodyToRangeRatio;
         DisplacementAtrMultiplier = strategy.DisplacementAtrMultiplier;
@@ -224,6 +231,8 @@ public sealed class StrategyDefinitionOptions
     public int MaxSetupAgeCandlesM5 { get; set; } = 12;
     public decimal MinFvgSizePips { get; set; } = 1.0m;
     public string FvgEntryMode { get; set; } = "Dynamic";
+    public decimal FVGPercentBoundary { get; set; } = 20m;
+    public bool AllowOrderBlockEntry { get; set; } = true;
     public bool RequireDisplacement { get; set; } = true;
     public decimal DisplacementMinBodyToRangeRatio { get; set; } = 0.60m;
     public decimal DisplacementAtrMultiplier { get; set; } = 1.20m;
@@ -250,6 +259,14 @@ public sealed class DailyTradingStopOptions
     public bool Enabled { get; set; } = true;
     public int MaxWinningTradesPerDay { get; set; } = 1;
     public int MaxLosingTradesPerDay { get; set; } = 2;
+}
+
+public sealed class ForexMarketSessionOptions
+{
+    public bool Enabled { get; set; } = true;
+    public string[] TradingDays { get; set; } = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+    public string LondonSessionNYTime { get; set; } = "03:00-12:00";
+    public string NewYorkSessionNYTime { get; set; } = "08:00-17:00";
 }
 
 public sealed class BrokerOptions

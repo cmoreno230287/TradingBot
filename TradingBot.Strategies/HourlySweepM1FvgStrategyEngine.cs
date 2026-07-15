@@ -229,7 +229,7 @@ public sealed class HourlySweepM1FvgStrategyEngine(
     {
         if (string.Equals(options.FvgEntryMode, "FivePercentBoundary", StringComparison.OrdinalIgnoreCase))
         {
-            return SmartMoneyStrategyEngine.ResolveFivePercentBoundaryEntry(fvg, direction);
+            return SmartMoneyStrategyEngine.ResolveFivePercentBoundaryEntry(fvg, direction, options.FVGPercentBoundary);
         }
 
         if (string.Equals(options.FvgEntryMode, "Boundary", StringComparison.OrdinalIgnoreCase))

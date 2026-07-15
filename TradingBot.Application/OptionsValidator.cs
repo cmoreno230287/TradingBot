@@ -90,6 +90,11 @@ public static class OptionsValidator
             return Result.Failure("MinFvgSizePips cannot be negative.");
         }
 
+        if (options.FVGPercentBoundary <= 0m || options.FVGPercentBoundary >= 100m)
+        {
+            return Result.Failure("FVGPercentBoundary must be greater than 0 and less than 100.");
+        }
+
         if (options.TradeTracking.MaxRowsPerFile <= 0 || options.TradeTracking.LookbackDays <= 0)
         {
             return Result.Failure("TradeTracking:MaxRowsPerFile and TradeTracking:LookbackDays must be greater than zero.");
@@ -99,6 +104,32 @@ public static class OptionsValidator
             && (options.DailyTradingStop.MaxWinningTradesPerDay <= 0 || options.DailyTradingStop.MaxLosingTradesPerDay <= 0))
         {
             return Result.Failure("DailyTradingStop winning and losing trade limits must be greater than zero.");
+        }
+
+        if (options.ForexMarketSessions.Enabled)
+        {
+            if (options.ForexMarketSessions.TradingDays.Length == 0)
+            {
+                return Result.Failure("ForexMarketSessions:TradingDays must contain at least one day.");
+            }
+
+            foreach (var day in options.ForexMarketSessions.TradingDays)
+            {
+                if (!Enum.TryParse<DayOfWeek>(day, ignoreCase: true, out _))
+                {
+                    return Result.Failure($"ForexMarketSessions:TradingDays contains an invalid day '{day}'.");
+                }
+            }
+
+            if (!IsTimeRange(options.ForexMarketSessions.LondonSessionNYTime))
+            {
+                return Result.Failure("ForexMarketSessions:LondonSessionNYTime must use HH:mm-HH:mm format.");
+            }
+
+            if (!IsTimeRange(options.ForexMarketSessions.NewYorkSessionNYTime))
+            {
+                return Result.Failure("ForexMarketSessions:NewYorkSessionNYTime must use HH:mm-HH:mm format.");
+            }
         }
 
         if (options.MaxActiveTrades <= 0)
@@ -178,6 +209,14 @@ public static class OptionsValidator
         }
 
         return Result.Success();
+    }
+
+    private static bool IsTimeRange(string value)
+    {
+        var parts = value.Split('-', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length == 2
+            && TimeSpan.TryParse(parts[0], out _)
+            && TimeSpan.TryParse(parts[1], out _);
     }
 
     private static Result ValidateFundedChallenge(FundedAccountChallengeOptions challenge)

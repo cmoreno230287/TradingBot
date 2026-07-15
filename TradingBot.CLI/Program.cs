@@ -80,7 +80,7 @@ static ServiceRegistry BuildServices(string appsettingsPath, TradingBotOptions o
         ? new MT5MarketDataProvider(mt5Bridge)
         : new CTraderMarketDataProvider(cTraderJsonApi, options);
     var newsFilter = new NewsFilter(options);
-    var sessionClock = new NewYorkSessionClock();
+    var sessionClock = new NewYorkSessionClock(options);
     var strategy = BuildStrategyEngine(options, marketData, newsFilter, sessionClock);
     var risk = new RiskManager(options);
     var historicalProvider = BuildHistoricalProvider(options, cTraderJsonApi, mt5Bridge);
@@ -171,8 +171,15 @@ static async Task<int> StartAsync(ServiceRegistry services, string[] args, Cance
             CapturedConsoleOutput? trackingOutput = null;
             if (trackingMode)
             {
+                var trackingMarketSession = BuildForexMarketSessionStatus(services.Options, DateTimeOffset.UtcNow);
                 trackingOutput = await CaptureConsoleOutputAsync(async () =>
                 {
+                    if (!trackingMarketSession.IsOpen)
+                    {
+                        PrintTradeTrackingSkipped(trackingMarketSession);
+                        return 0;
+                    }
+
                     var trackingResult = await TrackClosedTradesAsync(services, cancellationToken);
                     if (trackingResult.IsSuccess)
                     {
@@ -394,7 +401,7 @@ static async Task<int> FindRecentSetupsAsync(ServiceRegistry services, string[] 
         }
 
         var marketData = new InMemoryMarketDataProvider(candles);
-        var strategy = BuildStrategyEngine(services.Options, marketData, new NewsFilter(services.Options), new NewYorkSessionClock());
+        var strategy = BuildStrategyEngine(services.Options, marketData, new NewsFilter(services.Options), new NewYorkSessionClock(services.Options));
 
         var cursorStep = ResolveAnalysisCursorStep(services.Options);
         for (var cursor = dayEnd; cursor >= dayStart && rows.Count < requestedCount && rows.Count < RecentValidSetupCsvWriter.MaxRows; cursor = cursor.Subtract(cursorStep))
@@ -1483,6 +1490,87 @@ static async Task<Result<DailyTradingStopStatus>> ValidateDailyTradingStopAsync(
         reason));
 }
 
+static async Task<ForexMarketSessionStatus> ValidateForexMarketSessionAsync(
+    ServiceRegistry services,
+    string cycleId,
+    DateTimeOffset now,
+    CancellationToken cancellationToken)
+{
+    var options = services.Options.ForexMarketSessions;
+    var status = BuildForexMarketSessionStatus(services.Options, now);
+
+    await services.Monitor.WriteAsync(cycleId, "forex_market_session_checked", new
+    {
+        status.IsOpen,
+        session = status.Session.ToString(),
+        status.NewYorkTime,
+        status.Reason,
+        options.TradingDays,
+        options.LondonSessionNYTime,
+        options.NewYorkSessionNYTime
+    }, cancellationToken);
+
+    return status;
+}
+
+static ForexMarketSessionStatus BuildForexMarketSessionStatus(TradingBotOptions botOptions, DateTimeOffset now)
+{
+    var options = botOptions.ForexMarketSessions;
+    var newYorkTime = ToNewYorkTime(now);
+    if (!options.Enabled)
+    {
+        return new ForexMarketSessionStatus(
+            true,
+            SessionName.Closed,
+            newYorkTime,
+            "Forex market session guard is disabled.");
+    }
+
+    var tradingDays = options.TradingDays
+        .Select(day => Enum.Parse<DayOfWeek>(day, ignoreCase: true))
+        .ToHashSet();
+    var isTradingDay = tradingDays.Contains(newYorkTime.DayOfWeek);
+    var london = ParseSessionWindow(options.LondonSessionNYTime, "ForexMarketSessions:LondonSessionNYTime");
+    var newYork = ParseSessionWindow(options.NewYorkSessionNYTime, "ForexMarketSessions:NewYorkSessionNYTime");
+    var time = newYorkTime.TimeOfDay;
+    var isLondonOpen = london.Contains(time);
+    var isNewYorkOpen = newYork.Contains(time);
+    var session = isLondonOpen && isNewYorkOpen
+        ? SessionName.LondonNewYorkOverlap
+        : isLondonOpen
+            ? SessionName.London
+            : isNewYorkOpen
+                ? SessionName.NewYork
+                : SessionName.Closed;
+    var isOpen = isTradingDay && session != SessionName.Closed;
+    var reason = isOpen
+        ? $"Forex market session is open: {session}."
+        : !isTradingDay
+            ? $"Forex market session is closed because {newYorkTime.DayOfWeek} is not configured as a trading day."
+            : "Forex market session is closed because current New York time is outside London and New York global sessions.";
+
+    return new ForexMarketSessionStatus(isOpen, session, newYorkTime, reason);
+}
+
+static DateTimeOffset ToNewYorkTime(DateTimeOffset timestamp)
+{
+    var nyZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+    return TimeZoneInfo.ConvertTime(timestamp, nyZone);
+}
+
+static SessionWindow ParseSessionWindow(string value, string optionName)
+{
+    var parts = value.Split('-', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+    if (parts.Length != 2
+        || !TimeSpan.TryParse(parts[0], out var start)
+        || !TimeSpan.TryParse(parts[1], out var end))
+    {
+        throw new InvalidOperationException($"{optionName} must use HH:mm-HH:mm format.");
+    }
+
+    return new SessionWindow(start, end);
+}
+
 static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
     ServiceRegistry services,
     bool requireLiveConfirmation,
@@ -1520,6 +1608,60 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
         }, cancellationToken);
         Console.Error.WriteLine("Live-environment order creation requires CTrader:AllowLiveOrderCreation=true or confirm_live_order=true.");
         return 2;
+    }
+
+    var analysisTime = DateTimeOffset.UtcNow;
+    var forexMarketSession = await ValidateForexMarketSessionAsync(services, cycleId, analysisTime, cancellationToken);
+    if (!forexMarketSession.IsOpen)
+    {
+        await services.Monitor.WriteAsync(cycleId, "forex_market_session_rejected", new
+        {
+            session = forexMarketSession.Session.ToString(),
+            forexMarketSession.NewYorkTime,
+            forexMarketSession.Reason
+        }, cancellationToken);
+
+        if (formattedOutput)
+        {
+            PrintCycleHeader(services.Options, new TradeSignal(
+                services.Options.Symbol,
+                TradeDirection.Buy,
+                0m,
+                0m,
+                0m,
+                0m,
+                forexMarketSession.Session,
+                false,
+                forexMarketSession.Reason));
+            PrintForexMarketSession(forexMarketSession);
+            PrintInvalidSetup(new TradeSignal(
+                services.Options.Symbol,
+                TradeDirection.Buy,
+                0m,
+                0m,
+                0m,
+                0m,
+                forexMarketSession.Session,
+                false,
+                forexMarketSession.Reason));
+        }
+        else
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new
+            {
+                isOrderCreated = false,
+                reason = forexMarketSession.Reason,
+                forexMarketSession
+            }, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        await services.Monitor.WriteAsync(cycleId, "cycle_completed", new
+        {
+            isOrderCreated = false,
+            reason = forexMarketSession.Reason,
+            exitCode = 1
+        }, cancellationToken);
+        return 1;
     }
 
     var brokerResult = await PrepareConfiguredBrokerForMarketDataAsync(services, cancellationToken);
@@ -1650,7 +1792,7 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
         return 1;
     }
 
-    var signal = await services.Strategy.AnalyzeAsync(services.Options.Symbol, DateTimeOffset.UtcNow, cancellationToken);
+    var signal = await services.Strategy.AnalyzeAsync(services.Options.Symbol, analysisTime, cancellationToken);
     await services.Monitor.WriteAsync(cycleId, "strategy_analyzed", new
     {
         signal.Symbol,
@@ -1668,6 +1810,7 @@ static async Task<int> ExecuteAnalyzeAndCreateOrderAsync(
     if (formattedOutput)
     {
         PrintCycleHeader(services.Options, signal);
+        PrintForexMarketSession(forexMarketSession);
         var brokerOrderStatus = await ReportBrokerOrderStatusAsync(services, cycleId, formattedOutput, cancellationToken);
         if (brokerOrderStatus.IsSuccess)
         {
@@ -2207,6 +2350,8 @@ static void PrintCycleHeader(TradingBotOptions options, TradeSignal signal)
     Console.WriteLine($"Engine : {options.ActiveStrategy.Engine}");
     Console.WriteLine($"Symbol : {signal.Symbol}");
     Console.WriteLine($"Session: {signal.Session}");
+    Console.WriteLine($"Kill Zone    : {(signal.Session == SessionName.Closed ? "Outside configured kill zone" : "Inside configured kill zone")}");
+    Console.WriteLine($"Out-of-zone  : {(options.TradeOutKillZoneTime ? "Allowed" : "Blocked")}");
 }
 
 static void PrintInvalidSetup(TradeSignal signal)
@@ -2276,6 +2421,22 @@ static void PrintTradeTracking(int fetchedTrades, int writtenTrades, string dire
     Console.WriteLine($"Fetched Closed: {fetchedTrades}");
     Console.WriteLine($"New CSV Rows  : {writtenTrades}");
     Console.WriteLine($"Directory     : {directory}");
+}
+
+static void PrintTradeTrackingSkipped(ForexMarketSessionStatus status)
+{
+    Console.WriteLine();
+    Console.WriteLine("Trade Tracking: SKIPPED");
+    Console.WriteLine($"Reason        : {status.Reason}");
+}
+
+static void PrintForexMarketSession(ForexMarketSessionStatus status)
+{
+    Console.WriteLine();
+    Console.WriteLine($"Market Session: {status.Session}");
+    Console.WriteLine($"Market Status : {(status.IsOpen ? "Open" : "Closed")}");
+    Console.WriteLine($"NY Time       : {status.NewYorkTime:yyyy-MM-dd HH:mm:ss zzz}");
+    Console.WriteLine($"Reason        : {status.Reason}");
 }
 
 static void PrintDailyTradingStop(DailyTradingStopStatus status)
@@ -2539,6 +2700,20 @@ internal sealed record DailyTradingStopStatus(
     DateTimeOffset TradingDayStart,
     DateTimeOffset TradingDayEnd,
     string Reason);
+
+internal sealed record ForexMarketSessionStatus(
+    bool IsOpen,
+    SessionName Session,
+    DateTimeOffset NewYorkTime,
+    string Reason);
+
+internal readonly record struct SessionWindow(TimeSpan Start, TimeSpan End)
+{
+    public bool Contains(TimeSpan value) =>
+        Start <= End
+            ? value >= Start && value <= End
+            : value >= Start || value <= End;
+}
 
 internal sealed class InMemoryMarketDataProvider(IReadOnlyDictionary<Timeframe, IReadOnlyList<Candle>> candles) : IMarketDataProvider
 {
