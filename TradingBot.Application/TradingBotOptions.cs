@@ -85,7 +85,7 @@ public sealed class TradingBotOptions
     [JsonIgnore]
     public string FvgEntryMode { get; set; } = "Dynamic";
     [JsonIgnore]
-    public decimal FVGPercentBoundary { get; set; } = 20m;
+    public decimal FVGPercentBoundary { get; set; } = 5m;
     [JsonIgnore]
     public bool AllowOrderBlockEntry { get; set; } = true;
     public string DefaultFvgEntryMode { get; set; } = "Midpoint";
@@ -231,7 +231,7 @@ public sealed class StrategyDefinitionOptions
     public int MaxSetupAgeCandlesM5 { get; set; } = 12;
     public decimal MinFvgSizePips { get; set; } = 1.0m;
     public string FvgEntryMode { get; set; } = "Dynamic";
-    public decimal FVGPercentBoundary { get; set; } = 20m;
+    public decimal FVGPercentBoundary { get; set; } = 5m;
     public bool AllowOrderBlockEntry { get; set; } = true;
     public bool RequireDisplacement { get; set; } = true;
     public decimal DisplacementMinBodyToRangeRatio { get; set; } = 0.60m;

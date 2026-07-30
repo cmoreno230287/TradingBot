@@ -20,10 +20,10 @@ var tests = new (string Name, Action Test)[]
     ("Uses configured New York kill-zone session times", UsesConfiguredNewYorkKillZoneSessionTimes),
     ("Writes recent setup CSV with row cap", WritesRecentSetupCsvWithRowCap)
     ,("Detects H1 high sweep M1 sell FVG strategy", DetectsH1HighSweepM1SellFvgStrategy)
-    ,("Places H1 sell entry at twenty percent FVG lower boundary", PlacesH1SellEntryAtTwentyPercentFvgLowerBoundary)
+    ,("Places H1 sell entry at five percent FVG lower boundary", PlacesH1SellEntryAtFivePercentFvgLowerBoundary)
     ,("Detects H1 low sweep M1 buy FVG strategy", DetectsH1LowSweepM1BuyFvgStrategy)
     ,("Detects V2 SMC liquidity sweep CHOCH buy strategy", DetectsV2SmcLiquiditySweepChochBuyStrategy)
-    ,("Places V2 buy entry at twenty percent FVG upper boundary", PlacesV2BuyEntryAtTwentyPercentFvgUpperBoundary)
+    ,("Places V2 buy entry at five percent FVG upper boundary", PlacesV2BuyEntryAtFivePercentFvgUpperBoundary)
     ,("Rejects V2 order block fallback when disabled", RejectsV2OrderBlockFallbackWhenDisabled)
     ,("Keeps V2 setup id stable across repeated analysis", KeepsV2SetupIdStableAcrossRepeatedAnalysis)
     ,("Allows V2 setup when displacement requirement is disabled", AllowsV2SetupWhenDisplacementRequirementIsDisabled)
@@ -262,7 +262,7 @@ static void DetectsH1HighSweepM1SellFvgStrategy()
     Assert(signal.EntryPrice == signal.FairValueGap!.Midpoint, "Expected FVG midpoint entry.");
 }
 
-static void PlacesH1SellEntryAtTwentyPercentFvgLowerBoundary()
+static void PlacesH1SellEntryAtFivePercentFvgLowerBoundary()
 {
     var now = new DateTimeOffset(2026, 5, 26, 11, 10, 0, TimeSpan.Zero);
     var h1 = new[]
@@ -295,7 +295,7 @@ static void PlacesH1SellEntryAtTwentyPercentFvgLowerBoundary()
             TradeOutKillZoneTime = true,
             MinFvgSizePips = 0m,
             FvgEntryMode = "FivePercentBoundary",
-            FVGPercentBoundary = 20m
+            FVGPercentBoundary = 5m
         });
 
     var signal = strategy.AnalyzeAsync("EURUSD", now, CancellationToken.None).GetAwaiter().GetResult();
@@ -303,8 +303,8 @@ static void PlacesH1SellEntryAtTwentyPercentFvgLowerBoundary()
     Assert(signal.IsValidSetup, "Expected valid sell setup.");
     Assert(signal.Direction == TradeDirection.Sell, "Expected sell direction.");
     Assert(signal.FairValueGap is not null, "Expected sell FVG.");
-    var expectedEntry = signal.FairValueGap!.LowerPrice + (signal.FairValueGap.Size * 0.20m);
-    Assert(signal.EntryPrice == expectedEntry, "Expected sell entry at FVG lower + 20%.");
+    var expectedEntry = signal.FairValueGap!.LowerPrice + (signal.FairValueGap.Size * 0.05m);
+    Assert(signal.EntryPrice == expectedEntry, "Expected sell entry at FVG lower + 5%.");
 }
 
 static void DetectsH1LowSweepM1BuyFvgStrategy()
@@ -356,18 +356,18 @@ static void DetectsV2SmcLiquiditySweepChochBuyStrategy()
     Assert(!string.IsNullOrWhiteSpace(signal.SetupId), "Expected stable V2 setup id.");
 }
 
-static void PlacesV2BuyEntryAtTwentyPercentFvgUpperBoundary()
+static void PlacesV2BuyEntryAtFivePercentFvgUpperBoundary()
 {
     var signal = AnalyzeV2BuyFixture(
         new DateTimeOffset(2026, 5, 26, 11, 10, 0, TimeSpan.Zero),
         fvgEntryMode: "FivePercentBoundary",
-        fvgPercentBoundary: 20m);
+        fvgPercentBoundary: 5m);
 
     Assert(signal.IsValidSetup, $"Expected valid V2 setup. Reason: {signal.SetupReason}");
     Assert(signal.Direction == TradeDirection.Buy, "Expected V2 buy direction.");
     Assert(signal.FairValueGap is not null, "Expected V2 buy FVG.");
-    var expectedEntry = signal.FairValueGap!.UpperPrice - (signal.FairValueGap.Size * 0.20m);
-    Assert(signal.EntryPrice == expectedEntry, "Expected buy entry at FVG upper - 20%.");
+    var expectedEntry = signal.FairValueGap!.UpperPrice - (signal.FairValueGap.Size * 0.05m);
+    Assert(signal.EntryPrice == expectedEntry, "Expected buy entry at FVG upper - 5%.");
 }
 
 static void RejectsV2OrderBlockFallbackWhenDisabled()
@@ -458,7 +458,7 @@ static TradeSignal AnalyzeV2BuyFixture(
     bool requireDisplacement = true,
     decimal displacementAtrMultiplier = 1.0m,
     string fvgEntryMode = "Midpoint",
-    decimal fvgPercentBoundary = 20m)
+    decimal fvgPercentBoundary = 5m)
 {
     var now = new DateTimeOffset(2026, 5, 26, 11, 10, 0, TimeSpan.Zero);
     var d1 = new[]

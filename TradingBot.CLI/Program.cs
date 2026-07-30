@@ -2523,15 +2523,10 @@ static void ClearConsoleFully()
 
     try
     {
-        if (OperatingSystem.IsWindows())
-        {
-            if (ConsoleCleaner.ClearLikeCls())
-            {
-                return;
-            }
-        }
-
-        Console.Clear();
+        // Clear the visible screen, clear scrollback, then move the cursor home.
+        // Windows Terminal supports this and it behaves closer to running `cls`.
+        Console.Write("\u001b[2J\u001b[3J\u001b[H");
+        return;
     }
     catch
     {
