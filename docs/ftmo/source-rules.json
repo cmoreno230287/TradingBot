@@ -1,0 +1,24 @@
+{
+  "source": "C:/Codex/Codex_Agents/Expert_Trader/Resources/FTMO_AccountChallenge_Info.png",
+  "observed": {
+    "currencySymbol": "$",
+    "minimumTradingDays": 2,
+    "maximumDailyLossAmount": 5000,
+    "maximumLossAmount": 10000,
+    "profitTargetAmount": 5000,
+    "initialBalance": null,
+    "accountVariant": null,
+    "tradingPeriod": null,
+    "newsRestrictions": null,
+    "overnightRestrictions": null,
+    "instrumentRestrictions": null
+  },
+  "userConfirmedInputs": {"initialBalance": 100000, "currency": "USD", "source": "User confirmation in conversation"},
+  "supplementaryRuleSemantics": {
+    "dailyResetZone": "Europe/Prague",
+    "dailyLossBasis": "midnight balance minus current equity including floating P&L and fees",
+    "maximumLossModel": "static initial balance floor; 1-Step trailing rules unsupported",
+    "sources": ["https://ftmo.com/en/trading-objectives/", "https://academy.ftmo.com/lesson/maximum-daily-loss/"]
+  },
+  "confirmationRequiredBeforeLiveUse": true
+}

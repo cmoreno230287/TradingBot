@@ -18,6 +18,10 @@ TradingBot.CLI/bin/**/appsettings.json
 data/
 reports/
 
+# Codex Skills and Agents
+.agents/
+AGENTS.md
+
 # Angular / Node
 node_modules/
 TradingBot.Web/node_modules/

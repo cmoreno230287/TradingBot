@@ -5,7 +5,6 @@
     <ProjectReference Include="..\TradingBot.Domain\TradingBot.Domain.csproj" />
     <ProjectReference Include="..\TradingBot.Infrastructure\TradingBot.Infrastructure.csproj" />
     <ProjectReference Include="..\TradingBot.Strategies\TradingBot.Strategies.csproj" />
-    <ProjectReference Include="..\TradingBot.Backtesting\TradingBot.Backtesting.csproj" />
     <ProjectReference Include="..\TradingBot.Reporting\TradingBot.Reporting.csproj" />
     <ProjectReference Include="..\TradingBot.Shared\TradingBot.Shared.csproj" />
   </ItemGroup>
@@ -14,6 +13,14 @@
     <None Update="appsettings.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
+    <None Include="..\tools\mt5-bridge\mt5_bridge.py" Link="tools\mt5-bridge\mt5_bridge.py" CopyToPublishDirectory="Always" />
+    <None Include="..\tools\mt5-bridge\ftmo_guard.py" Link="tools\mt5-bridge\ftmo_guard.py" CopyToPublishDirectory="Always" />
+    <None Include="..\tools\mt5-bridge\live_*.py" Link="tools\mt5-bridge\%(Filename)%(Extension)" CopyToPublishDirectory="Always" />
+    <None Include="..\tools\mt5-bridge\requirements.txt" Link="tools\mt5-bridge\requirements.txt" CopyToPublishDirectory="Always" />
+    <None Include="..\tools\mt5-bridge\supervise_bridge.py" Link="tools\mt5-bridge\supervise_bridge.py" CopyToPublishDirectory="Always" />
+    <None Update="appsettings.live.example.json" CopyToPublishDirectory="Always" />
+    <None Include="..\tools\run-live-supervised.ps1" Link="tools\run-live-supervised.ps1" CopyToPublishDirectory="Always" />
+    <None Include="..\tools\cli-watchdog.ps1" Link="tools\cli-watchdog.ps1" CopyToPublishDirectory="Always" />
   </ItemGroup>
 
   <PropertyGroup>

@@ -11,12 +11,15 @@ namespace TradingBot.Infrastructure.MetaTrader;
 public sealed class MT5BridgeClient
 {
     private readonly TradingBotOptions _options;
+    private readonly long _accountId;
     private readonly HttpClient _httpClient;
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
+    public long ConfiguredAccountId => _accountId;
 
     public MT5BridgeClient(TradingBotOptions options)
     {
         _options = options;
+        _accountId = options.MT5.AccountId;
         _httpClient = new HttpClient
         {
             BaseAddress = new Uri(options.MT5.BridgeBaseUrl.TrimEnd('/') + "/"),
@@ -111,6 +114,36 @@ public sealed class MT5BridgeClient
         }
 
         return Result<StaleOrderCleanupResult>.Success(new StaleOrderCleanupResult(array.GetArrayLength(), cancelled.Count, cancelled));
+    }
+
+    public async Task<Result<IReadOnlyList<PendingBrokerOrder>>> GetPendingOrdersAsync(CancellationToken cancellationToken)
+    {
+        var path = $"orders?symbol={Uri.EscapeDataString(_options.Symbol)}&magicNumber={_options.MT5.MagicNumber}";
+        var ordersResult = await GetJsonAsync(path, "MT5 pending orders", cancellationToken);
+        if (!ordersResult.IsSuccess)
+        {
+            return Result<IReadOnlyList<PendingBrokerOrder>>.Failure(ordersResult.Error!);
+        }
+
+        var array = FindArray(ordersResult.Value, "orders") ?? (ordersResult.Value.ValueKind == JsonValueKind.Array ? ordersResult.Value : default);
+        if (array.ValueKind != JsonValueKind.Array)
+        {
+            return Result<IReadOnlyList<PendingBrokerOrder>>.Success([]);
+        }
+
+        var orders = array.EnumerateArray()
+            .Select(ParsePendingOrder)
+            .Where(order => order is not null)
+            .Select(order => order!)
+            .ToArray();
+
+        return Result<IReadOnlyList<PendingBrokerOrder>>.Success(orders);
+    }
+
+    public async Task<Result> CancelPendingOrderAsync(string ticket, CancellationToken cancellationToken)
+    {
+        var result = await DeleteJsonAsync($"orders/{Uri.EscapeDataString(ticket)}", "MT5 pending order cancellation", cancellationToken);
+        return result.IsSuccess ? Result.Success() : Result.Failure(result.Error!);
     }
 
     public async Task<Result<IReadOnlyList<ClosedTradeReport>>> GetClosedTradesAsync(
@@ -215,6 +248,10 @@ public sealed class MT5BridgeClient
         decimal lots,
         CancellationToken cancellationToken)
     {
+        if (!_options.LiveTradingEnabled)
+            return Result<BrokerOrderCreationResult>.Failure("LiveTradingEnabled=false blocks new orders.");
+        if (_options.FtmoProtection.Enabled)
+            return Result<BrokerOrderCreationResult>.Failure("FTMO orders must use the protected execution endpoint.");
         var clientOrderId = $"tradingbot-mt5-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}";
         var payload = new
         {
@@ -263,6 +300,59 @@ public sealed class MT5BridgeClient
         catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or JsonException)
         {
             return Result<BrokerOrderCreationResult>.Failure($"Unable to create MT5 order through bridge '{_options.MT5.BridgeBaseUrl}': {exception.Message}");
+        }
+    }
+
+    public async Task<Result<JsonElement>> FtmoRequestAsync(string operation, TradeSignal? signal, decimal lots, CancellationToken cancellationToken)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var configuredAccountId = _accountId;
+        if (configuredAccountId <= 0)
+            return Result<JsonElement>.Failure($"FTMO {operation} blocked: MT5 account ID is not configured in the bridge client.");
+        var calendar = NewsCalendarState.Current(_options, now);
+        // Use a concrete dictionary at the HTTP boundary. Anonymous request types can be
+        // serialized as an empty object by trimmed/published runtimes when reflection
+        // metadata is unavailable; an explicit dictionary keeps the wire contract intact.
+        var payload = new Dictionary<string, object?>
+        {
+            ["policy"] = _options.FtmoProtection,
+            ["entryEnabled"] = LiveEntryPolicy.BlockReason(_options) is null,
+            ["useNewsFilter"] = _options.UseNewsFilter,
+            ["newsCoverageFromUtc"] = calendar?.CoverageFromUtc,
+            ["newsCoverageUntilUtc"] = calendar?.CoverageUntilUtc,
+            ["newsBlackoutWindowsUtc"] = calendar?.BlackoutWindowsUtc ?? [],
+            ["newsGeneratedAtUtc"] = calendar?.GeneratedAtUtc,
+            ["newsMaximumAgeMinutes"] = _options.NewsCalendar.Enabled ? _options.NewsCalendar.MaximumAgeMinutes : 0,
+            ["strategyVersion"] = LiveStrategyIdentity.Version(_options),
+            ["minutesBeforeHighImpactNews"] = _options.MinutesBeforeHighImpactNews,
+            ["minutesAfterHighImpactNews"] = _options.MinutesAfterHighImpactNews,
+            ["dayStartUtc"] = FtmoClock.DayStart(now),
+            ["nextDayStartUtc"] = FtmoClock.NextDayStart(now),
+            ["accountId"] = configuredAccountId,
+            ["symbol"] = _options.Symbol,
+            ["magicNumber"] = _options.MT5.MagicNumber,
+            ["maxSpreadPips"] = _options.MaxSpreadPips,
+            ["signal"] = signal,
+            ["lots"] = lots
+        };
+        try
+        {
+            var json = JsonSerializer.Serialize(payload, _jsonOptions);
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"ftmo/{operation}")
+            {
+                Content = new StringContent(json, Encoding.UTF8, "application/json")
+            };
+            request.Headers.TryAddWithoutValidation("X-TradingBot-AccountId",
+                configuredAccountId.ToString(CultureInfo.InvariantCulture));
+            using var response = await _httpClient.SendAsync(request, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            if (!response.IsSuccessStatusCode) return Result<JsonElement>.Failure($"FTMO bridge {operation} rejected (requestAccountId={configuredAccountId}): {body}");
+            using var document = JsonDocument.Parse(body);
+            return Result<JsonElement>.Success(document.RootElement.Clone());
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return Result<JsonElement>.Failure($"FTMO bridge {operation} unavailable: {exception.Message}");
         }
     }
 
@@ -352,6 +442,41 @@ public sealed class MT5BridgeClient
     {
         var array = FindArray(root, propertyName) ?? (root.ValueKind == JsonValueKind.Array ? root : default);
         return array.ValueKind == JsonValueKind.Array ? array.GetArrayLength() : 0;
+    }
+
+    private static PendingBrokerOrder? ParsePendingOrder(JsonElement order)
+    {
+        var type = (int)(ReadLong(order, "type") ?? -1);
+        var direction = type switch
+        {
+            2 => TradeDirection.Buy,
+            3 => TradeDirection.Sell,
+            _ => (TradeDirection?)null
+        };
+
+        if (direction is null)
+        {
+            return null;
+        }
+
+        var ticket = ReadString(order, "ticket")
+            ?? ReadString(order, "order")
+            ?? ReadString(order, "brokerOrderId")
+            ?? "";
+        if (string.IsNullOrWhiteSpace(ticket))
+        {
+            return null;
+        }
+
+        return new PendingBrokerOrder(
+            ticket,
+            ReadString(order, "symbol") ?? "",
+            direction.Value,
+            ReadDecimal(order, "price_open"),
+            ReadDecimal(order, "sl"),
+            ReadDecimal(order, "tp"),
+            ReadDecimal(order, "price_current"),
+            ReadDateTime(order, "time_setup"));
     }
 
     private static JsonElement? FindArray(JsonElement root, string propertyName)

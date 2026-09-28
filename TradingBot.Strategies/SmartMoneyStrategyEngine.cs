@@ -314,7 +314,7 @@ public sealed class SmartMoneyStrategyEngine(
     {
         if (string.Equals(options.FvgEntryMode, "FivePercentBoundary", StringComparison.OrdinalIgnoreCase))
         {
-            return ResolveFivePercentBoundaryEntry(fvg, direction);
+            return ResolveFivePercentBoundaryEntry(fvg, direction, options.FVGPercentBoundary);
         }
 
         if (string.Equals(options.FvgEntryMode, "Boundary", StringComparison.OrdinalIgnoreCase))
@@ -325,9 +325,9 @@ public sealed class SmartMoneyStrategyEngine(
         return fvg.Midpoint;
     }
 
-    public static decimal ResolveFivePercentBoundaryEntry(FairValueGap fvg, TradeDirection direction)
+    public static decimal ResolveFivePercentBoundaryEntry(FairValueGap fvg, TradeDirection direction, decimal boundaryPercent)
     {
-        var offset = fvg.Size * 0.05m;
+        var offset = fvg.Size * (boundaryPercent / 100m);
         return direction == TradeDirection.Buy
             ? fvg.UpperPrice - offset
             : fvg.LowerPrice + offset;

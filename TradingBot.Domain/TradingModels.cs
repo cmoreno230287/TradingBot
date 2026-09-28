@@ -74,18 +74,3 @@ public sealed record TradeJournalEntry
     public string NewsFilterStatus { get; init; } = "";
     public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
 }
-
-public sealed record BacktestMetrics(
-    int TotalTrades,
-    decimal WinRate,
-    decimal ProfitFactor,
-    decimal MaxDrawdown,
-    decimal AverageRiskReward,
-    int ConsecutiveLosses,
-    int ConsecutiveWins,
-    decimal Expectancy,
-    int TotalValidSetups = 0);
-
-public sealed record BacktestResult(
-    IReadOnlyList<TradeJournalEntry> Trades,
-    BacktestMetrics Metrics);

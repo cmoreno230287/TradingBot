@@ -13,8 +13,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TradingBot.Infrastructure",
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TradingBot.Strategies", "TradingBot.Strategies\TradingBot.Strategies.csproj", "{51B7B733-BC1B-4E5E-9EA2-975046B61D98}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TradingBot.Backtesting", "TradingBot.Backtesting\TradingBot.Backtesting.csproj", "{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}"
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TradingBot.Reporting", "TradingBot.Reporting\TradingBot.Reporting.csproj", "{C992AF10-67C9-4A47-AFF7-F03ECB1D7727}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TradingBot.Shared", "TradingBot.Shared\TradingBot.Shared.csproj", "{2FAF4BBE-497D-4534-A6FF-29064489A44C}"
@@ -91,18 +89,6 @@ Global
 		{51B7B733-BC1B-4E5E-9EA2-975046B61D98}.Release|x64.Build.0 = Release|Any CPU
 		{51B7B733-BC1B-4E5E-9EA2-975046B61D98}.Release|x86.ActiveCfg = Release|Any CPU
 		{51B7B733-BC1B-4E5E-9EA2-975046B61D98}.Release|x86.Build.0 = Release|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Debug|x64.Build.0 = Debug|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Debug|x86.ActiveCfg = Debug|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Debug|x86.Build.0 = Debug|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Release|Any CPU.Build.0 = Release|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Release|x64.ActiveCfg = Release|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Release|x64.Build.0 = Release|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Release|x86.ActiveCfg = Release|Any CPU
-		{B71CAA98-C86C-4485-AB1B-3A601B31D5F2}.Release|x86.Build.0 = Release|Any CPU
 		{C992AF10-67C9-4A47-AFF7-F03ECB1D7727}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{C992AF10-67C9-4A47-AFF7-F03ECB1D7727}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{C992AF10-67C9-4A47-AFF7-F03ECB1D7727}.Debug|x64.ActiveCfg = Debug|Any CPU

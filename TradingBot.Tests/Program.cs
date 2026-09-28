@@ -1,5 +1,4 @@
 using TradingBot.Application;
-using TradingBot.Backtesting;
 using TradingBot.Domain;
 using TradingBot.Infrastructure.Filters;
 using TradingBot.Infrastructure.MarketData;
@@ -7,22 +6,24 @@ using TradingBot.Infrastructure.Sessions;
 using TradingBot.Reporting;
 using TradingBot.Strategies;
 
+if (args.Length == 4 && args[0] == "--health-test-child") { await ProcessHealthTests.Child(args); return; }
+
 var tests = new (string Name, Action Test)[]
 {
     ("Detects bullish FVG", DetectsBullishFvg),
     ("Rejects excessive risk", RejectsExcessiveRisk),
-    ("Calculates backtest metrics", CalculatesBacktestMetrics),
     ("Writes CSV journal", WritesCsvJournal),
     ("Resolves active strategy", ResolvesActiveStrategy),
-    ("Resolves first enabled backtesting source", ResolvesFirstEnabledBacktestingSource),
     ("Resolves first enabled funded challenge", ResolvesFirstEnabledFundedChallenge),
     ("Serializes appsettings without legacy duplicates", SerializesAppsettingsWithoutLegacyDuplicates),
+    ("Uses configured New York kill-zone session times", UsesConfiguredNewYorkKillZoneSessionTimes),
     ("Writes recent setup CSV with row cap", WritesRecentSetupCsvWithRowCap)
     ,("Detects H1 high sweep M1 sell FVG strategy", DetectsH1HighSweepM1SellFvgStrategy)
     ,("Places H1 sell entry at five percent FVG lower boundary", PlacesH1SellEntryAtFivePercentFvgLowerBoundary)
     ,("Detects H1 low sweep M1 buy FVG strategy", DetectsH1LowSweepM1BuyFvgStrategy)
     ,("Detects V2 SMC liquidity sweep CHOCH buy strategy", DetectsV2SmcLiquiditySweepChochBuyStrategy)
     ,("Places V2 buy entry at five percent FVG upper boundary", PlacesV2BuyEntryAtFivePercentFvgUpperBoundary)
+    ,("Rejects V2 order block fallback when disabled", RejectsV2OrderBlockFallbackWhenDisabled)
     ,("Keeps V2 setup id stable across repeated analysis", KeepsV2SetupIdStableAcrossRepeatedAnalysis)
     ,("Allows V2 setup when displacement requirement is disabled", AllowsV2SetupWhenDisplacementRequirementIsDisabled)
 };
@@ -32,6 +33,12 @@ foreach (var test in tests)
     test.Test();
     Console.WriteLine($"PASS {test.Name}");
 }
+
+FtmoTests.Run();
+FtmoSmcTests.Run();
+LiveTradingTests.Run();
+ProcessHealthTests.Run();
+MT5BridgeTests.Run().GetAwaiter().GetResult();
 
 static void DetectsBullishFvg()
 {
@@ -55,25 +62,6 @@ static void RejectsExcessiveRisk()
     var request = new OrderRequest("EURUSD", TradeDirection.Buy, OrderType.Limit, 1.1000m, 1.0990m, 1.1030m, 0m, 2.0m);
     var decision = riskManager.Evaluate(request, new AccountSnapshot(10_000m, 10_000m, 0m, 0m, 0, 0));
     Assert(!decision.IsAllowed, "Expected risk rejection.");
-}
-
-static void CalculatesBacktestMetrics()
-{
-    var trades = new[]
-    {
-        new TradeJournalEntry { ProfitLossAmount = 100m, RiskRewardRatio = 2m },
-        new TradeJournalEntry { ProfitLossAmount = -50m, RiskRewardRatio = 2m },
-        new TradeJournalEntry { ProfitLossAmount = 150m, RiskRewardRatio = 3m }
-    };
-
-    var metrics = BacktestingEngine.CalculateMetrics(trades);
-    Assert(metrics.TotalTrades == 3, "Expected three trades.");
-    Assert(metrics.TotalValidSetups == 0, "Expected default valid setup count.");
-    Assert(metrics.WinRate == 66.67m, "Unexpected win rate.");
-    Assert(metrics.ProfitFactor == 5.00m, "Unexpected profit factor.");
-
-    var metricsWithSetups = BacktestingEngine.CalculateMetrics(trades, validSetups: 5);
-    Assert(metricsWithSetups.TotalValidSetups == 5, "Expected valid setup count.");
 }
 
 static void WritesCsvJournal()
@@ -111,26 +99,6 @@ static void ResolvesActiveStrategy()
     Assert(!options.UseDailyBiasFilter, "Expected strategy daily-bias setting to be applied.");
 }
 
-static void ResolvesFirstEnabledBacktestingSource()
-{
-    var options = new TradingBotOptions
-    {
-        Backtesting = new BacktestingOptions
-        {
-            DataSources =
-            [
-                new BacktestingDataSourceOptions { Name = "cTrader", DataSource = "cTrader", Enabled = false },
-                new BacktestingDataSourceOptions { Name = "MT5", DataSource = "MT5", Enabled = true, CacheDirectory = "data/mt5" }
-            ]
-        }
-    };
-
-    options.Normalize();
-    Assert(options.ActiveBacktestingDataSource.DataSource == "MT5", "Expected first enabled backtesting source.");
-    Assert(options.ActiveBacktestingDataSource.DataSource == "MT5", "Expected active backtesting source to be normalized.");
-    Assert(options.Backtesting.CacheDirectory == "data/mt5", "Expected active cache directory to be applied.");
-}
-
 static void ResolvesFirstEnabledFundedChallenge()
 {
     var options = new TradingBotOptions
@@ -165,8 +133,28 @@ static void SerializesAppsettingsWithoutLegacyDuplicates()
     Assert(!root.TryGetProperty("MinRiskReward", out _), "Expected risk/reward strategy settings to be owned by Strategies.");
     Assert(!root.TryGetProperty("AllowedSessions", out _), "Expected session settings to be owned by TradingSessions.");
     Assert(!root.TryGetProperty("FTMOChallenge", out _), "Expected challenge settings to be owned by FundedAccountChallenges.");
-    Assert(root.GetProperty("Backtesting").TryGetProperty("DataSources", out _), "Expected backtesting sources to be configured as a list.");
-    Assert(!root.GetProperty("Backtesting").TryGetProperty("DataSource", out _), "Expected legacy backtesting source field to be hidden.");
+}
+
+static void UsesConfiguredNewYorkKillZoneSessionTimes()
+{
+    var options = new TradingBotOptions
+    {
+        TradingSessions = new TradingSessionOptions
+        {
+            LondonKillZoneNYTime = "04:00-05:00",
+            NewYorkKillZoneNYTime = "09:30-10:30",
+            LondonNewYorkOverlapNYTime = "11:00-12:00"
+        }
+    };
+
+    options.Normalize();
+    var clock = new NewYorkSessionClock(options);
+
+    var london = clock.GetCurrentSession(DateTimeOffset.Parse("2026-07-06T08:30:00+00:00"));
+    var closed = clock.GetCurrentSession(DateTimeOffset.Parse("2026-07-06T07:30:00+00:00"));
+
+    Assert(london == SessionName.London, "Expected configured London kill-zone session.");
+    Assert(closed == SessionName.Closed, "Expected old hardcoded London time to be closed after config change.");
 }
 
 static void WritesRecentSetupCsvWithRowCap()
@@ -270,7 +258,8 @@ static void PlacesH1SellEntryAtFivePercentFvgLowerBoundary()
         {
             TradeOutKillZoneTime = true,
             MinFvgSizePips = 0m,
-            FvgEntryMode = "FivePercentBoundary"
+            FvgEntryMode = "FivePercentBoundary",
+            FVGPercentBoundary = 5m
         });
 
     var signal = strategy.AnalyzeAsync("EURUSD", now, CancellationToken.None).GetAwaiter().GetResult();
@@ -335,13 +324,78 @@ static void PlacesV2BuyEntryAtFivePercentFvgUpperBoundary()
 {
     var signal = AnalyzeV2BuyFixture(
         new DateTimeOffset(2026, 5, 26, 11, 10, 0, TimeSpan.Zero),
-        fvgEntryMode: "FivePercentBoundary");
+        fvgEntryMode: "FivePercentBoundary",
+        fvgPercentBoundary: 5m);
 
     Assert(signal.IsValidSetup, $"Expected valid V2 setup. Reason: {signal.SetupReason}");
     Assert(signal.Direction == TradeDirection.Buy, "Expected V2 buy direction.");
     Assert(signal.FairValueGap is not null, "Expected V2 buy FVG.");
     var expectedEntry = signal.FairValueGap!.UpperPrice - (signal.FairValueGap.Size * 0.05m);
     Assert(signal.EntryPrice == expectedEntry, "Expected buy entry at FVG upper - 5%.");
+}
+
+static void RejectsV2OrderBlockFallbackWhenDisabled()
+{
+    var now = new DateTimeOffset(2026, 7, 15, 13, 59, 0, TimeSpan.Zero);
+    var d1 = new[]
+    {
+        new Candle("EURUSD", Timeframe.D1, now.AddDays(-3), 1.1300m, 1.1380m, 1.1280m, 1.1360m, 100),
+        new Candle("EURUSD", Timeframe.D1, now.AddDays(-2), 1.1360m, 1.1410m, 1.1340m, 1.1390m, 100),
+        new Candle("EURUSD", Timeframe.D1, now.AddDays(-1), 1.1390m, 1.1460m, 1.1370m, 1.1440m, 100)
+    };
+    var h1 = new[]
+    {
+        new Candle("EURUSD", Timeframe.H1, now.AddHours(-3), 1.1360m, 1.1400m, 1.1350m, 1.1390m, 100),
+        new Candle("EURUSD", Timeframe.H1, now.AddHours(-2), 1.1390m, 1.1430m, 1.1380m, 1.1420m, 100),
+        new Candle("EURUSD", Timeframe.H1, now.AddHours(-1), 1.1420m, 1.1460m, 1.1410m, 1.1450m, 100)
+    };
+    var m5 = new[]
+    {
+        M5(now, -55, 1.1420m, 1.1430m, 1.1410m, 1.1425m),
+        M5(now, -50, 1.1425m, 1.1440m, 1.1415m, 1.1435m),
+        M5(now, -45, 1.1435m, 1.1445m, 1.1412m, 1.1420m),
+        M5(now, -40, 1.1420m, 1.1450m, 1.1400m, 1.1440m),
+        M5(now, -35, 1.1440m, 1.1460m, 1.1430m, 1.1450m),
+        M5(now, -30, 1.1450m, 1.1470m, 1.1440m, 1.1460m),
+        M5(now, -25, 1.1460m, 1.1480m, 1.1450m, 1.1470m)
+    };
+    var m1 = new[]
+    {
+        M1(now, -16, 1.1420m, 1.1430m, 1.1415m, 1.1425m),
+        M1(now, -15, 1.1425m, 1.1435m, 1.1418m, 1.1430m),
+        M1(now, -14, 1.1430m, 1.1438m, 1.1420m, 1.1434m),
+        M1(now, -13, 1.1434m, 1.1440m, 1.1410m, 1.1430m),
+        M1(now, -12, 1.1430m, 1.1445m, 1.1420m, 1.1440m),
+        M1(now, -11, 1.1440m, 1.1450m, 1.1435m, 1.1448m),
+        M1(now, -10, 1.1448m, 1.1460m, 1.1440m, 1.1455m),
+        M1(now, -9, 1.1455m, 1.1470m, 1.1450m, 1.1465m),
+        M1(now, -8, 1.1465m, 1.1480m, 1.1460m, 1.1475m)
+    };
+
+    var strategy = new SmcLiquiditySweepChochStrategyEngine(
+        new TestMarketDataProvider(new Dictionary<Timeframe, IReadOnlyList<Candle>>
+        {
+            [Timeframe.D1] = d1,
+            [Timeframe.H1] = h1,
+            [Timeframe.M5] = m5,
+            [Timeframe.M1] = m1
+        }),
+        new TestNewsFilter(),
+        new TestSessionClock(),
+        new TradingBotOptions
+        {
+            TradeOutKillZoneTime = true,
+            LiquiditySweepLookbackCandles = 3,
+            SetupLookbackCandlesM5 = 20,
+            MinRiskReward = 2m,
+            PreferredRiskReward = 2m,
+            RequireDisplacement = false,
+            AllowOrderBlockEntry = false
+        });
+
+    var signal = strategy.AnalyzeAsync("EURUSD", now, CancellationToken.None).GetAwaiter().GetResult();
+
+    Assert(!signal.IsValidSetup, "Expected V2 setup to reject order block fallback when disabled.");
 }
 
 static void KeepsV2SetupIdStableAcrossRepeatedAnalysis()
@@ -367,7 +421,8 @@ static TradeSignal AnalyzeV2BuyFixture(
     DateTimeOffset analysisTime,
     bool requireDisplacement = true,
     decimal displacementAtrMultiplier = 1.0m,
-    string fvgEntryMode = "Midpoint")
+    string fvgEntryMode = "Midpoint",
+    decimal fvgPercentBoundary = 5m)
 {
     var now = new DateTimeOffset(2026, 5, 26, 11, 10, 0, TimeSpan.Zero);
     var d1 = new[]
@@ -435,7 +490,8 @@ static TradeSignal AnalyzeV2BuyFixture(
             DisplacementAtrMultiplier = displacementAtrMultiplier,
             RequireDisplacement = requireDisplacement,
             UsePremiumDiscountFilter = true,
-            FvgEntryMode = fvgEntryMode
+            FvgEntryMode = fvgEntryMode,
+            FVGPercentBoundary = fvgPercentBoundary
         });
 
     return strategy.AnalyzeAsync("EURUSD", analysisTime, CancellationToken.None).GetAwaiter().GetResult();

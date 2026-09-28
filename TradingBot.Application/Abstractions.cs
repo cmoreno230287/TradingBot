@@ -8,36 +8,6 @@ public interface IMarketDataProvider
     Task<IReadOnlyList<Candle>> GetCandlesAsync(string symbol, Timeframe timeframe, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken);
 }
 
-public sealed record HistoricalDataRequest(
-    string Symbol,
-    Timeframe Timeframe,
-    DateTimeOffset From,
-    DateTimeOffset To);
-
-public interface IHistoricalMarketDataProvider
-{
-    string ProviderName { get; }
-
-    Task<IReadOnlyList<Candle>> GetCandlesAsync(HistoricalDataRequest request, CancellationToken cancellationToken);
-}
-
-public sealed record HistoricalTickDataRequest(
-    string Symbol,
-    DateTimeOffset From,
-    DateTimeOffset To);
-
-public interface IHistoricalTickDataProvider
-{
-    string ProviderName { get; }
-
-    Task<IReadOnlyList<MarketTick>> GetTicksAsync(HistoricalTickDataRequest request, CancellationToken cancellationToken);
-}
-
-public interface IHistoricalMarketDataProviderFactory
-{
-    IHistoricalMarketDataProvider Resolve(string providerName);
-}
-
 public sealed record ActiveTradeSummary(int OpenPositions, int PendingOrders)
 {
     public int TotalActiveTrades => OpenPositions + PendingOrders;
@@ -67,6 +37,16 @@ public sealed record StaleOrderCleanupResult(
     int CheckedOrders,
     int CancelledOrders,
     IReadOnlyList<string> CancelledOrderIds);
+
+public sealed record PendingBrokerOrder(
+    string Ticket,
+    string Symbol,
+    TradeDirection Direction,
+    decimal EntryPrice,
+    decimal StopLoss,
+    decimal TakeProfit,
+    decimal CurrentPrice,
+    DateTimeOffset? CreatedAt);
 
 public sealed record ClosedTradeReport(
     string TradeId,
@@ -103,11 +83,6 @@ public interface IStrategyEngine
 public interface IRiskManager
 {
     RiskDecision Evaluate(OrderRequest request, AccountSnapshot account);
-}
-
-public interface IBacktestingEngine
-{
-    Task<BacktestResult> RunAsync(string symbol, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken);
 }
 
 public interface IJournalWriter

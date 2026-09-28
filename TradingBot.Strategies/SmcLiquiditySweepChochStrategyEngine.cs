@@ -294,12 +294,17 @@ public sealed class SmcLiquiditySweepChochStrategyEngine(
             && candle.Range >= prior.Average(item => item.Range) * options.DisplacementAtrMultiplier;
     }
 
-    private static EntryZone? ResolveEntryZone(IReadOnlyList<Candle> candles, TradeDirection direction, int displacementIndex)
+    private EntryZone? ResolveEntryZone(IReadOnlyList<Candle> candles, TradeDirection direction, int displacementIndex)
     {
         var fvg = DetectFairValueGap(candles, direction, displacementIndex);
         if (fvg is not null)
         {
             return fvg;
+        }
+
+        if (!options.AllowOrderBlockEntry)
+        {
+            return null;
         }
 
         return DetectOrderBlock(candles, direction, displacementIndex);
@@ -356,7 +361,8 @@ public sealed class SmcLiquiditySweepChochStrategyEngine(
         {
             return SmartMoneyStrategyEngine.ResolveFivePercentBoundaryEntry(
                 new FairValueGap(direction, zone.LowerPrice, zone.UpperPrice, zone.CreatedAt),
-                direction);
+                direction,
+                options.FVGPercentBoundary);
         }
 
         if (string.Equals(options.FvgEntryMode, "Boundary", StringComparison.OrdinalIgnoreCase))

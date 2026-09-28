@@ -6,3 +6,6 @@ python tools\mt5-bridge\mt5_bridge.py --host 127.0.0.1 --port 5010
 
 ============= Executing the Bot ========================
 dotnet run --project TradingBot.CLI -- start mode=tracking
+
+1. cd C:\TradingBot
+2. & "C:\TradingBot\Start-TradingBot.ps1"

@@ -22,6 +22,11 @@ public static class JsonOptionsLoader
         }
 
         var json = File.ReadAllText(path);
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.EnumerateObject().Any(p => p.Name.Equals("Backtesting", StringComparison.OrdinalIgnoreCase)
+            || p.Name.Equals("MinimumBacktestTrades", StringComparison.OrdinalIgnoreCase)
+            || p.Name.Equals("RecommendedBacktestTrades", StringComparison.OrdinalIgnoreCase)))
+            Console.Error.WriteLine("Configuration migration: obsolete simulation settings are ignored; remove Backtesting and backtest trade-count fields.");
         var options = JsonSerializer.Deserialize<TradingBotOptions>(json, SerializerOptions) ?? new TradingBotOptions();
         options.Normalize();
         return options;
