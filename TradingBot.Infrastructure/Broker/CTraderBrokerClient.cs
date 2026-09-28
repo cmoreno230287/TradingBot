@@ -8,11 +8,6 @@ public sealed class CTraderBrokerClient(TradingBotOptions options) : IBrokerClie
 {
     public Task<Result> ValidateConnectionAsync(CancellationToken cancellationToken)
     {
-        if (!options.LiveTradingEnabled)
-        {
-            return Task.FromResult(Result.Success());
-        }
-
         var clientId = options.CTrader.ClientId;
         var clientSecret = options.CTrader.ClientSecret;
 
@@ -25,8 +20,7 @@ public sealed class CTraderBrokerClient(TradingBotOptions options) : IBrokerClie
     {
         if (!options.LiveTradingEnabled)
         {
-            var paperId = $"PAPER-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}";
-            return Task.FromResult(Result<OrderResult>.Success(new OrderResult(paperId, true, "Paper order accepted.")));
+            return Task.FromResult(Result<OrderResult>.Failure("Live trading is disabled; no order was created."));
         }
 
         return Task.FromResult(Result<OrderResult>.Failure("Real cTrader order execution is not configured yet. Add the cTrader Open API adapter behind IBrokerClient."));

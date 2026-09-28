@@ -9,10 +9,12 @@ public sealed class TradingBotOptions
     [JsonIgnore]
     public string Symbol { get; set; } = "EURUSD";
     public string Broker { get; set; } = "cTrader";
-    public bool LiveTradingEnabled { get; set; }
+    public bool LiveTradingEnabled { get; set; } = true;
+    public FtmoProtectionOptions FtmoProtection { get; set; } = new();
+    public FtmoPullbackOptions FtmoPullback { get; set; } = new();
+    public FtmoSmcOptions FtmoSmc { get; set; } = new();
     public int AnalysisExecutionIntervalSeconds { get; set; } = 60;
     public StrategySelectionOptions Strategies { get; set; } = StrategySelectionOptions.CreateDefault();
-    public BacktestingOptions Backtesting { get; set; } = new();
     [JsonIgnore]
     public FTMOChallengeOptions FTMOChallenge { get; set; } = new();
     public FundedAccountChallengesOptions FundedAccountChallenges { get; set; } = new();
@@ -96,7 +98,18 @@ public sealed class TradingBotOptions
     public decimal PartialClosePercent { get; set; } = 50m;
     public decimal PartialCloseAtRR { get; set; } = 1.0m;
     public bool UseNewsFilter { get; set; } = true;
+    public NewsCalendarOptions NewsCalendar { get; set; } = new();
+    private NewsCalendarSnapshot? liveNewsCalendar;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public NewsCalendarSnapshot? LiveNewsCalendar
+    {
+        get => Volatile.Read(ref liveNewsCalendar);
+        set => Volatile.Write(ref liveNewsCalendar, value);
+    }
     public string[] NewsBlackoutWindowsUtc { get; set; } = [];
+    public DateTimeOffset? NewsCoverageFromUtc { get; set; }
+    public DateTimeOffset? NewsCoverageUntilUtc { get; set; }
+    public string[] BrokerMarketClosuresUtc { get; set; } = [];
     public int MinutesBeforeHighImpactNews { get; set; } = 15;
     public int MinutesAfterHighImpactNews { get; set; } = 30;
     public decimal NormalStopLossBufferPips { get; set; } = 2.0m;
@@ -116,8 +129,6 @@ public sealed class TradingBotOptions
     public string LondonNewYorkOverlapNYTime { get; set; } = "08:00-11:00";
     public int PendingOrderExpirationCandlesM5 { get; set; } = 6;
     public int PendingOrderExpirationCandlesM1 { get; set; } = 10;
-    public int MinimumBacktestTrades { get; set; } = 200;
-    public int RecommendedBacktestTrades { get; set; } = 500;
     public string ReportsDirectory { get; set; } = "reports";
     public OperationalMonitoringOptions OperationalMonitoring { get; set; } = new();
     public TradeTrackingOptions TradeTracking { get; set; } = new();
@@ -128,8 +139,6 @@ public sealed class TradingBotOptions
     [JsonIgnore]
     public StrategyDefinitionOptions ActiveStrategy { get; private set; } = StrategyDefinitionOptions.CreateDefault();
 
-    [JsonIgnore]
-    public BacktestingDataSourceOptions ActiveBacktestingDataSource { get; private set; } = BacktestingDataSourceOptions.CreateLegacyDefault();
 
     [JsonIgnore]
     public FundedAccountChallengeOptions? ActiveFundedAccountChallenge { get; private set; }
@@ -141,8 +150,6 @@ public sealed class TradingBotOptions
 
         ApplyTradingSessions();
 
-        ActiveBacktestingDataSource = Backtesting.ResolveActive();
-        Backtesting.ApplyActive(ActiveBacktestingDataSource);
 
         ActiveFundedAccountChallenge = FundedAccountChallenges.ResolveActive();
         if (ActiveFundedAccountChallenge is not null)
@@ -298,70 +305,6 @@ public sealed class CTraderOptions
     public int JsonPort { get; set; } = 5036;
 }
 
-public sealed class BacktestingOptions
-{
-    [JsonIgnore]
-    public string DataSource { get; set; } = "cTrader";
-    [JsonIgnore]
-    public bool CacheEnabled { get; set; } = true;
-    [JsonIgnore]
-    public string CacheDirectory { get; set; } = "data/historical";
-    [JsonIgnore]
-    public int HistoricalDataChunkDaysM1 { get; set; } = 7;
-    [JsonIgnore]
-    public int HistoricalDataChunkDaysM5 { get; set; } = 30;
-    [JsonIgnore]
-    public int HistoricalDataChunkDaysH1 { get; set; } = 180;
-    [JsonIgnore]
-    public int HistoricalDataChunkDaysD1 { get; set; } = 365;
-    public List<BacktestingDataSourceOptions> DataSources { get; set; } =
-    [
-        new() { Name = "cTrader", Enabled = true, DataSource = "cTrader" },
-        new() { Name = "MT5", Enabled = false, DataSource = "MT5" }
-    ];
-    [JsonIgnore]
-    public BacktestingDataSourceOptions CTrader { get; set; } = new() { Name = "cTrader", Enabled = false, DataSource = "cTrader" };
-    [JsonIgnore]
-    public BacktestingDataSourceOptions MT5 { get; set; } = new() { Name = "MT5", Enabled = false, DataSource = "MT5" };
-
-    public BacktestingDataSourceOptions ResolveActive()
-    {
-        var candidates = DataSources
-            .Concat([CTrader, MT5])
-            .Where(item => item.Enabled)
-            .ToArray();
-
-        if (candidates.Length > 0)
-        {
-            return candidates[0];
-        }
-
-        return new BacktestingDataSourceOptions
-        {
-            Name = DataSource,
-            Enabled = true,
-            DataSource = DataSource,
-            CacheEnabled = CacheEnabled,
-            CacheDirectory = CacheDirectory,
-            HistoricalDataChunkDaysM1 = HistoricalDataChunkDaysM1,
-            HistoricalDataChunkDaysM5 = HistoricalDataChunkDaysM5,
-            HistoricalDataChunkDaysH1 = HistoricalDataChunkDaysH1,
-            HistoricalDataChunkDaysD1 = HistoricalDataChunkDaysD1
-        };
-    }
-
-    public void ApplyActive(BacktestingDataSourceOptions active)
-    {
-        DataSource = string.IsNullOrWhiteSpace(active.DataSource) ? active.Name : active.DataSource;
-        CacheEnabled = active.CacheEnabled;
-        CacheDirectory = active.CacheDirectory;
-        HistoricalDataChunkDaysM1 = active.HistoricalDataChunkDaysM1;
-        HistoricalDataChunkDaysM5 = active.HistoricalDataChunkDaysM5;
-        HistoricalDataChunkDaysH1 = active.HistoricalDataChunkDaysH1;
-        HistoricalDataChunkDaysD1 = active.HistoricalDataChunkDaysD1;
-    }
-}
-
 public sealed class TradingSessionOptions
 {
     public string[] AllowedSessions { get; set; } = ["London", "NewYork", "LondonNewYorkOverlap"];
@@ -369,21 +312,6 @@ public sealed class TradingSessionOptions
     public string NewYorkKillZoneNYTime { get; set; } = "08:30-11:00";
     public string LondonNewYorkOverlapNYTime { get; set; } = "08:00-11:00";
     public bool TradeOutKillZoneTime { get; set; }
-}
-
-public sealed class BacktestingDataSourceOptions
-{
-    public string Name { get; set; } = "cTrader";
-    public bool Enabled { get; set; }
-    public string DataSource { get; set; } = "cTrader";
-    public bool CacheEnabled { get; set; } = true;
-    public string CacheDirectory { get; set; } = "data/historical";
-    public int HistoricalDataChunkDaysM1 { get; set; } = 7;
-    public int HistoricalDataChunkDaysM5 { get; set; } = 30;
-    public int HistoricalDataChunkDaysH1 { get; set; } = 180;
-    public int HistoricalDataChunkDaysD1 { get; set; } = 365;
-
-    public static BacktestingDataSourceOptions CreateLegacyDefault() => new() { Enabled = true };
 }
 
 public sealed class FTMOChallengeOptions
@@ -481,11 +409,15 @@ public sealed class MT5Options
     public long MagicNumber { get; set; } = 20260520;
     public int MaxActiveTrades { get; set; } = 1;
     public int TimeoutSeconds { get; set; } = 10;
-    public bool AllowLiveOrderCreation { get; set; }
+    public bool AllowLiveOrderCreation { get; set; } = true;
     public int UnitsPerLot { get; set; } = 100000;
     public int PendingOrderExpirationHours { get; set; } = 12;
     public int MaxSlippagePoints { get; set; } = 20;
     public bool CancelStalePendingOrders { get; set; } = true;
+    public decimal MaxEntryDistancePips { get; set; } = 8m;
+    public bool CancelPendingOrderWhenSetupInvalid { get; set; } = true;
+    public bool CancelPendingOrderWhenDirectionChanges { get; set; } = true;
+    public decimal CancelPendingOrderWhenEntryDistanceExceedsPips { get; set; } = 12m;
 }
 
 

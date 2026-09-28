@@ -87,4 +87,13 @@ public sealed record TradeSignal(
     bool IsValidSetup,
     string SetupReason,
     FairValueGap? FairValueGap = null,
-    string? SetupId = null);
+    string? SetupId = null,
+    SmcSetupContext? SmcContext = null,
+    SetupDiagnostics? Diagnostics = null);
+
+public sealed record SetupDiagnostics(decimal AtrPips, decimal FvgSizePips, decimal StopPips,
+    decimal DisplacementBodyRatio, string SetupType);
+
+public sealed record SmcSetupContext(DateTimeOffset AnalyzedAt, DateTimeOffset SweepOpenedAt,
+    DateTimeOffset BreakOpenedAt, DateTimeOffset FvgConfirmedAt, DateTimeOffset SubmitBefore,
+    decimal SweepExtreme);

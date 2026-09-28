@@ -193,6 +193,8 @@ public sealed class CTraderJsonApiClient(TradingBotOptions options)
         string accessToken,
         CancellationToken cancellationToken)
     {
+        if (!options.LiveTradingEnabled)
+            return Result<CTraderCreateOrderResult>.Failure("LiveTradingEnabled=false blocks new orders.");
         var validation = ValidateCreateOrderSettings(entryPoint, quantityLots, accessToken);
         if (!validation.IsSuccess)
         {

@@ -1,0 +1,13 @@
+[
+  { "equity": 100000, "existingRisk": 0, "code": "Running" },
+  { "equity": 99000, "existingRisk": 0, "code": "DailyHalt" },
+  { "equity": 99900, "existingRisk": 900, "code": "DailyHalt" },
+  { "equity": 90500, "existingRisk": 0, "code": "TotalHalt" },
+  { "equity": 99999, "existingRisk": 0, "code": "Running" },
+  { "equity": 99000.01, "existingRisk": 0, "code": "Running" },
+  { "equity": 99999, "existingRisk": 999, "code": "DailyHalt" },
+  { "equity": 91500, "existingRisk": 1100, "dailyStartingBalance": 91000, "code": "TotalExposure" },
+  { "equity": 100000, "existingRisk": 0, "exposureKnown": false, "code": "UnknownExposure" },
+  { "equity": 100000, "existingRisk": 0, "currency": "EUR", "code": "CurrencyMismatch" },
+  { "equity": 100000, "existingRisk": 0, "killSwitch": true, "code": "KillHalt" }
+]

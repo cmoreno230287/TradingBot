@@ -13,7 +13,15 @@ public sealed class NewsFilter(TradingBotOptions options) : INewsFilter
             return false;
         }
 
-        foreach (var window in options.NewsBlackoutWindowsUtc)
+        var calendar = NewsCalendarState.Current(options, timestamp);
+        if ((options.FtmoProtection.Enabled || options.NewsCalendar.Enabled) && (calendar is null
+            || timestamp < calendar.CoverageFromUtc || timestamp >= calendar.CoverageUntilUtc))
+        {
+            reason = "News calendar coverage is missing or expired.";
+            return true;
+        }
+
+        foreach (var window in calendar?.BlackoutWindowsUtc ?? options.NewsBlackoutWindowsUtc)
         {
             if (!TryParseWindow(window, out var from, out var to))
             {

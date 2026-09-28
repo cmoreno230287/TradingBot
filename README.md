@@ -1,31 +1,26 @@
-# TradingBot.CLI
+# TradingBot — live-only MT5
+.NET 10 EURUSD Smart Money Concepts bot with protected account-wide risk checks.
 
-Clean Architecture .NET 10 console application for a Smart Money Concepts EURUSD trading bot.
+Live entry is enabled by default. The source configuration selects protected SMC at 0.25% risk on a USD 100,000 initial balance. Orders still require the intended account, confirmed rules, fresh protection/data and current news coverage. No simulation, replay or paper-trading commands remain.
 
-## Commands
+See [live operation, migration and recovery](docs/ftmo/live-only-operations.md) before starting.
 
-```bash
-dotnet run --project TradingBot.CLI -- start
-dotnet run --project TradingBot.CLI -- stop
+See [unattended protection, recovery, calendar integration and strategy evidence](docs/ftmo/unattended-improvements.md) for the current source improvements and remaining configuration requirements.
+
+```powershell
+dotnet build TradingBot.sln
+dotnet run --project TradingBot.Tests --no-build
+dotnet run --project TradingBot.CLI -- help
+dotnet run --project TradingBot.CLI -- status
 dotnet run --project TradingBot.CLI -- analyze
-dotnet run --project TradingBot.CLI -- backtest --from 2025-05-15 --to 2026-05-15
-dotnet run --project TradingBot.CLI -- find-recent-setups count=10 max_days=30
-dotnet run --project TradingBot.CLI -- download-history --from 2025-05-15 --to 2026-05-15 timeframe=M5
-dotnet run --project TradingBot.CLI -- ctrader-connect
-dotnet run --project TradingBot.CLI -- ctrader-authorize
-dotnet run --project TradingBot.CLI -- ctrader-request-token
-dotnet run --project TradingBot.CLI -- ctrader-refresh-token
-dotnet run --project TradingBot.CLI -- ctrader-accounts-list
-dotnet run --project TradingBot.CLI -- ctrader-account-details
-dotnet run --project TradingBot.CLI -- ctrader-symbols symbol=EURUSD
-dotnet run --project TradingBot.CLI -- ctrader-createorder entry_point=1.05000 quantity=0.01 confirm_live_order=true
-dotnet run --project TradingBot.CLI -- analyze-and-createorder confirm_live_order=true
 ```
 
-`start` validates configuration, runs `ctrader-connect`, then runs `analyze-and-createorder` repeatedly using `AnalysisExecutionIntervalSeconds` from `TradingBot.CLI/appsettings.json`.
+`status` reads cached protection health, reconciliation and performance without placing or cancelling orders. `analyze` reads current market data. `start` runs actual protected trading and monitoring. All commands accept `config=<path>`. A sanitized starting profile is [appsettings.live.example.json](TradingBot.CLI/appsettings.live.example.json); account and rule confirmation are intentionally not fabricated.
 
-Live-environment cTrader order creation requires `AllowLiveOrderCreation=true` in `TradingBot.CLI/appsettings.json` plus the explicit `confirm_live_order=true` command argument.
+```powershell
+./tools/package-live.ps1
+```
 
-Historical backtesting data is selected from the first enabled entry in `Backtesting.DataSources`. Current provider values are `cTrader` and `MT5`.
+Packaging produces .NET and Python bridge files together with a checksum manifest under `reports/live-release/`. It does not deploy or start trading.
 
-`find-recent-setups` starts with the previous trading day, scans backward by trading day through the first enabled historical provider, and writes up to 2000 valid setups to `reports/recent-setups`. `max_days` defaults to `30`; use `max_days=0` for an unbounded scan.
+Historical research reports under `docs/ftmo/` are retained as archives. Their simulation commands no longer exist, and their results are not evidence of current live profitability.

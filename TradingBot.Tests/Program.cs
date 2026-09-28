@@ -1,5 +1,4 @@
 using TradingBot.Application;
-using TradingBot.Backtesting;
 using TradingBot.Domain;
 using TradingBot.Infrastructure.Filters;
 using TradingBot.Infrastructure.MarketData;
@@ -7,14 +6,14 @@ using TradingBot.Infrastructure.Sessions;
 using TradingBot.Reporting;
 using TradingBot.Strategies;
 
+if (args.Length == 4 && args[0] == "--health-test-child") { await ProcessHealthTests.Child(args); return; }
+
 var tests = new (string Name, Action Test)[]
 {
     ("Detects bullish FVG", DetectsBullishFvg),
     ("Rejects excessive risk", RejectsExcessiveRisk),
-    ("Calculates backtest metrics", CalculatesBacktestMetrics),
     ("Writes CSV journal", WritesCsvJournal),
     ("Resolves active strategy", ResolvesActiveStrategy),
-    ("Resolves first enabled backtesting source", ResolvesFirstEnabledBacktestingSource),
     ("Resolves first enabled funded challenge", ResolvesFirstEnabledFundedChallenge),
     ("Serializes appsettings without legacy duplicates", SerializesAppsettingsWithoutLegacyDuplicates),
     ("Uses configured New York kill-zone session times", UsesConfiguredNewYorkKillZoneSessionTimes),
@@ -34,6 +33,12 @@ foreach (var test in tests)
     test.Test();
     Console.WriteLine($"PASS {test.Name}");
 }
+
+FtmoTests.Run();
+FtmoSmcTests.Run();
+LiveTradingTests.Run();
+ProcessHealthTests.Run();
+MT5BridgeTests.Run().GetAwaiter().GetResult();
 
 static void DetectsBullishFvg()
 {
@@ -57,25 +62,6 @@ static void RejectsExcessiveRisk()
     var request = new OrderRequest("EURUSD", TradeDirection.Buy, OrderType.Limit, 1.1000m, 1.0990m, 1.1030m, 0m, 2.0m);
     var decision = riskManager.Evaluate(request, new AccountSnapshot(10_000m, 10_000m, 0m, 0m, 0, 0));
     Assert(!decision.IsAllowed, "Expected risk rejection.");
-}
-
-static void CalculatesBacktestMetrics()
-{
-    var trades = new[]
-    {
-        new TradeJournalEntry { ProfitLossAmount = 100m, RiskRewardRatio = 2m },
-        new TradeJournalEntry { ProfitLossAmount = -50m, RiskRewardRatio = 2m },
-        new TradeJournalEntry { ProfitLossAmount = 150m, RiskRewardRatio = 3m }
-    };
-
-    var metrics = BacktestingEngine.CalculateMetrics(trades);
-    Assert(metrics.TotalTrades == 3, "Expected three trades.");
-    Assert(metrics.TotalValidSetups == 0, "Expected default valid setup count.");
-    Assert(metrics.WinRate == 66.67m, "Unexpected win rate.");
-    Assert(metrics.ProfitFactor == 5.00m, "Unexpected profit factor.");
-
-    var metricsWithSetups = BacktestingEngine.CalculateMetrics(trades, validSetups: 5);
-    Assert(metricsWithSetups.TotalValidSetups == 5, "Expected valid setup count.");
 }
 
 static void WritesCsvJournal()
@@ -113,26 +99,6 @@ static void ResolvesActiveStrategy()
     Assert(!options.UseDailyBiasFilter, "Expected strategy daily-bias setting to be applied.");
 }
 
-static void ResolvesFirstEnabledBacktestingSource()
-{
-    var options = new TradingBotOptions
-    {
-        Backtesting = new BacktestingOptions
-        {
-            DataSources =
-            [
-                new BacktestingDataSourceOptions { Name = "cTrader", DataSource = "cTrader", Enabled = false },
-                new BacktestingDataSourceOptions { Name = "MT5", DataSource = "MT5", Enabled = true, CacheDirectory = "data/mt5" }
-            ]
-        }
-    };
-
-    options.Normalize();
-    Assert(options.ActiveBacktestingDataSource.DataSource == "MT5", "Expected first enabled backtesting source.");
-    Assert(options.ActiveBacktestingDataSource.DataSource == "MT5", "Expected active backtesting source to be normalized.");
-    Assert(options.Backtesting.CacheDirectory == "data/mt5", "Expected active cache directory to be applied.");
-}
-
 static void ResolvesFirstEnabledFundedChallenge()
 {
     var options = new TradingBotOptions
@@ -167,8 +133,6 @@ static void SerializesAppsettingsWithoutLegacyDuplicates()
     Assert(!root.TryGetProperty("MinRiskReward", out _), "Expected risk/reward strategy settings to be owned by Strategies.");
     Assert(!root.TryGetProperty("AllowedSessions", out _), "Expected session settings to be owned by TradingSessions.");
     Assert(!root.TryGetProperty("FTMOChallenge", out _), "Expected challenge settings to be owned by FundedAccountChallenges.");
-    Assert(root.GetProperty("Backtesting").TryGetProperty("DataSources", out _), "Expected backtesting sources to be configured as a list.");
-    Assert(!root.GetProperty("Backtesting").TryGetProperty("DataSource", out _), "Expected legacy backtesting source field to be hidden.");
 }
 
 static void UsesConfiguredNewYorkKillZoneSessionTimes()

@@ -3,10 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import threading
+import time
+import os
+import math
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+import ftmo_guard
+from live_gate import GateBusyError
 
 try:
     import MetaTrader5 as mt5
@@ -19,6 +24,10 @@ else:
 
 MT5_INITIALIZE_LOCK = threading.Lock()
 MT5_INITIALIZED = False
+MT5_NEXT_INITIALIZE = 0.0
+MT5_INITIALIZE_FAILURES = 0
+ACTIVE_REQUESTS = {}
+ACTIVE_REQUESTS_LOCK = threading.Lock()
 MT5_TERMINAL_PATH: str | None = None
 MT5_INITIALIZE_TIMEOUT_MS = 60000
 
@@ -45,6 +54,13 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def request_health():
+    with ACTIVE_REQUESTS_LOCK:
+        now = time.monotonic()
+        return {"activeRequests": len(ACTIVE_REQUESTS),
+                "maximumRequestAgeSeconds": max((now - started for started in ACTIVE_REQUESTS.values()), default=0)}
+
+
 def parse_datetime(value: str) -> datetime:
     normalized = value.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
@@ -62,7 +78,7 @@ def to_jsonable(value: Any) -> Any:
 
 
 def ensure_mt5() -> None:
-    global MT5_INITIALIZED
+    global MT5_INITIALIZED, MT5_NEXT_INITIALIZE, MT5_INITIALIZE_FAILURES
 
     if mt5 is None:
         raise RuntimeError(
@@ -70,6 +86,8 @@ def ensure_mt5() -> None:
         ) from MT5_IMPORT_ERROR
 
     with MT5_INITIALIZE_LOCK:
+        if time.monotonic() < MT5_NEXT_INITIALIZE:
+            raise RuntimeError("MT5 reconnect backoff is active.")
         if MT5_INITIALIZED:
             terminal = mt5.terminal_info()
             if terminal is not None and getattr(terminal, "connected", False):
@@ -84,6 +102,8 @@ def ensure_mt5() -> None:
             initialized = mt5.initialize(timeout=MT5_INITIALIZE_TIMEOUT_MS)
 
         if not initialized:
+            MT5_INITIALIZE_FAILURES += 1
+            MT5_NEXT_INITIALIZE = time.monotonic() + min(60, 2 ** min(MT5_INITIALIZE_FAILURES, 6))
             code, message = mt5.last_error()
             path_hint = f" path='{MT5_TERMINAL_PATH}'" if MT5_TERMINAL_PATH else ""
             raise RuntimeError(
@@ -92,6 +112,8 @@ def ensure_mt5() -> None:
             )
 
         MT5_INITIALIZED = True
+        MT5_INITIALIZE_FAILURES = 0
+        MT5_NEXT_INITIALIZE = 0
 
 
 def account_info() -> dict[str, Any]:
@@ -236,6 +258,14 @@ def order_comment(client_order_id: str) -> str:
     return f"TBOT{suffix}"[:16]
 
 
+def pending_order_expiration_timestamp(tick: Any, expiration_minutes: int) -> int:
+    tick_time = int(getattr(tick, "time", 0) or 0)
+    if tick_time > 0:
+        return tick_time + (expiration_minutes * 60)
+
+    return int((datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)).timestamp())
+
+
 def trade_rejection_reason(response: dict[str, Any]) -> str:
     retcode = int(response.get("retcode", 0) or 0)
     comment = str(response.get("comment") or "").strip()
@@ -270,12 +300,20 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
         self._handle(lambda: self.route_delete())
 
     def _handle(self, action: Any) -> None:
+        tracked = urlparse(self.path).path not in ("/live-health", "/ftmo/status")
+        if tracked:
+            with ACTIVE_REQUESTS_LOCK:
+                ACTIVE_REQUESTS[id(self)] = time.monotonic()
         try:
             status, payload = action()
             self.send_json(status, payload)
         except Exception as exc:
             print(f"{utc_now()} ERROR {self.command} {self.path} failed: {exc}")
             self.send_json(500, {"error": str(exc)})
+        finally:
+            if tracked:
+                with ACTIVE_REQUESTS_LOCK:
+                    ACTIVE_REQUESTS.pop(id(self), None)
 
     def send_json(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
@@ -294,6 +332,10 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.strip("/")
         query = parse_qs(parsed.query)
+
+        if path == "live-health":
+            return 200, {"processId": os.getpid(), "gate": ftmo_guard.LOCK.health(),
+                         "initialized": MT5_INITIALIZED, "reconnectFailures": MT5_INITIALIZE_FAILURES, **request_health()}
 
         if path == "health":
             ensure_mt5()
@@ -340,6 +382,42 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
     def route_post(self) -> tuple[int, Any]:
         parsed = urlparse(self.path)
         path = parsed.path.strip("/")
+
+        if path.startswith("ftmo/"):
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            # The CLI sends the configured account in a header as an additional
+            # transport guard. Recover it only when the JSON body omitted the
+            # identity; a conflicting body/header pair remains invalid.
+            header_account = self.headers.get("X-TradingBot-AccountId")
+            if isinstance(payload, dict) and not payload.get("accountId") and header_account:
+                try:
+                    payload["accountId"] = int(header_account)
+                except (TypeError, ValueError):
+                    pass
+            if path == "ftmo/protect":
+                print(f"{datetime.now(timezone.utc).isoformat()} FTMO protect request keys={sorted(payload.keys())} headerAccount={header_account!r}", flush=True)
+            # Be explicit at the wire boundary: clients using either JSON naming convention
+            # must resolve to the same validated account identity.
+            if isinstance(payload, dict) and not payload.get("accountId"):
+                for alias in ("AccountId", "accountID", "account_id"):
+                    if payload.get(alias):
+                        payload["accountId"] = payload[alias]
+                        break
+            if path == "ftmo/status":
+                return 200, dict(ftmo_guard.health(payload), requests=request_health())
+            ensure_mt5()
+            if path == "ftmo/snapshot":
+                return 200, ftmo_guard.snapshot(mt5, payload)
+            if path == "ftmo/protect":
+                return 200, ftmo_guard.protect(mt5, payload, self.cancel_order)
+            if path == "ftmo/orders":
+                try:
+                    return ftmo_guard.submit(mt5, payload, self.create_order)
+                except GateBusyError:
+                    return 200, {"accepted": False, "retryable": True, "executionState": "not_sent",
+                                 "error": "Protection has priority; no submission was started."}
+            return 404, {"error": "Unknown FTMO endpoint"}
 
         if path == "orders":
             length = int(self.headers.get("Content-Length", "0"))
@@ -512,6 +590,9 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
                 commission = float(exit_deal.get("commission") or 0)
                 swap = float(exit_deal.get("swap") or 0)
                 fee = float(exit_deal.get("fee") or 0)
+                entry_commission, entry_fee = ftmo_guard.allocated_entry_costs(entries, float(exit_deal.get("volume") or 0))
+                commission += entry_commission
+                fee += entry_fee
                 entry_price = float(entry.get("price") or 0)
                 close_price = float(exit_deal.get("price") or 0)
                 stop_loss = float(exit_deal.get("sl") or entry.get("sl") or 0)
@@ -576,7 +657,7 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
             "tp": take_profit,
             "deviation": deviation,
             "magic": magic,
-            "comment": order_comment(client_order_id),
+            "comment": ("FTMO" + client_order_id[:16]) if payload.get("requireExpiration") else order_comment(client_order_id),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_RETURN,
         }
@@ -584,9 +665,27 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
         expiration_minutes = int(payload.get("expirationMinutes") or 0)
         if expiration_minutes > 0:
             request["type_time"] = mt5.ORDER_TIME_SPECIFIED
-            request["expiration"] = int((datetime.now(timezone.utc) + timedelta(minutes=expiration_minutes)).timestamp())
+            request["expiration"] = pending_order_expiration_timestamp(tick, expiration_minutes)
 
         expiration_requested = "expiration" in request
+        if payload.get("requireExpiration"):
+            request["type"] = mt5.ORDER_TYPE_BUY_LIMIT if side.upper() == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
+            if abs(request["volume"] - lots) > 1e-8:
+                return 400, {"error": "Broker normalization would change risk-validated volume.", "definitelyNotSent": True}
+            check = mt5.order_check(request)
+            if check is None or check.retcode != 0:
+                return 400, {"error": "FTMO broker preflight rejected order.", "check": to_jsonable(check),
+                             "definitelyNotSent": True, "retryable": check is None}
+            # Preflight itself can block. Recheck the guard's deadline at the actual send boundary.
+            if datetime.now(timezone.utc).timestamp() >= float(payload.get("sendBeforeTimestamp", 0)):
+                return 400, {"error": "Protection/news/signal deadline expired during broker preflight.", "definitelyNotSent": True}
+            final_tick = mt5.symbol_info_tick(symbol)
+            if final_tick is None or not all(math.isfinite(float(v)) for v in (final_tick.bid, final_tick.ask, final_tick.time)) \
+                    or not -5 <= datetime.now(timezone.utc).timestamp() - final_tick.time <= payload["maximumQuoteAgeSeconds"]:
+                return 400, {"error": "Quote expired during broker preflight.", "definitelyNotSent": True, "retryable": True}
+            if final_tick.bid <= 0 or final_tick.ask < final_tick.bid or (final_tick.ask - final_tick.bid) / .0001 > payload["maxSpreadPips"] \
+                    or (side.upper() == "BUY" and price >= final_tick.ask) or (side.upper() == "SELL" and price <= final_tick.bid):
+                return 400, {"error": "Price/spread changed during broker preflight.", "definitelyNotSent": True}
         result = mt5.order_send(request)
         if result is None:
             code, message = mt5.last_error()
@@ -594,7 +693,7 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
 
         response = to_jsonable(result)
         accepted_retcodes = {mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED}
-        if int(response.get("retcode", 0)) == 10022 and expiration_requested:
+        if int(response.get("retcode", 0)) == 10022 and expiration_requested and not payload.get("requireExpiration"):
             retry_request = dict(request)
             retry_request["type_time"] = mt5.ORDER_TIME_GTC
             retry_request.pop("expiration", None)
@@ -607,8 +706,16 @@ class MT5BridgeHandler(BaseHTTPRequestHandler):
             response = to_jsonable(result)
 
         if int(response.get("retcode", 0)) not in accepted_retcodes:
+            retry_codes = {getattr(mt5, name, -1) for name in ("TRADE_RETCODE_REQUOTE", "TRADE_RETCODE_PRICE_CHANGED",
+                "TRADE_RETCODE_PRICE_OFF", "TRADE_RETCODE_TOO_MANY_REQUESTS", "TRADE_RETCODE_LOCKED")}
+            rejected_codes = retry_codes | {getattr(mt5, name, -1) for name in ("TRADE_RETCODE_REJECT", "TRADE_RETCODE_INVALID",
+                "TRADE_RETCODE_INVALID_VOLUME", "TRADE_RETCODE_INVALID_PRICE", "TRADE_RETCODE_INVALID_STOPS",
+                "TRADE_RETCODE_TRADE_DISABLED", "TRADE_RETCODE_MARKET_CLOSED", "TRADE_RETCODE_NO_MONEY",
+                "TRADE_RETCODE_INVALID_EXPIRATION", "TRADE_RETCODE_INVALID_FILL", "TRADE_RETCODE_CLIENT_DISABLES_AT")}
             return 400, {
                 "error": "MT5 rejected order creation.",
+                "definitelyNotSent": int(response.get("retcode", 0)) in rejected_codes,
+                "retryable": int(response.get("retcode", 0)) in retry_codes,
                 "reason": trade_rejection_reason(response),
                 "retcode": int(response.get("retcode", 0) or 0),
                 "request": request,
@@ -655,6 +762,14 @@ def main() -> int:
     parser.add_argument("--terminal-path", default="", help="Optional full path to terminal64.exe for the FTMO MT5 terminal.")
     args = parser.parse_args()
     MT5_TERMINAL_PATH = args.terminal_path.strip() or None
+    if mt5 is None:
+        print("Bridge dependency missing: install tools/mt5-bridge/requirements.txt in this Python environment.")
+        return 2
+    try:
+        ftmo_guard.ZoneInfo("Europe/Prague")
+    except Exception:
+        print("Timezone dependency missing: install tzdata from tools/mt5-bridge/requirements.txt.")
+        return 2
 
     print(f"Starting TradingBot MT5 bridge on http://{args.host}:{args.port}")
     print("Keep FTMO-MT5 open and logged in while this process is running.")
